@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="/mnt/bindmounts/npmplus-cert"
-
 echo
 echo "=================================================="
-echo " NPM Plus 인증서 → AdGuard Home 자동 연결"
+echo " NPM Plus → AdGuard Home 인증서 자동 연동"
 echo "=================================================="
 echo
 
@@ -19,18 +17,26 @@ command -v pct >/dev/null 2>&1 || {
     exit 1
 }
 
+# --------------------------------------------------
+# LXC 선택
+# --------------------------------------------------
+
 read -rp "NPM Plus LXC 번호: " NPMID
 read -rp "AdGuard Home LXC 번호: " ADGID
 
-pct status "$NPMID" >/dev/null 2>&1 || {
+if ! pct status "$NPMID" >/dev/null 2>&1; then
     echo "[오류] NPM Plus LXC $NPMID 를 찾을 수 없습니다."
     exit 1
-}
+fi
 
-pct status "$ADGID" >/dev/null 2>&1 || {
+if ! pct status "$ADGID" >/dev/null 2>&1; then
     echo "[오류] AdGuard Home LXC $ADGID 를 찾을 수 없습니다."
     exit 1
-}
+fi
+
+# --------------------------------------------------
+# 인증서 종류
+# --------------------------------------------------
 
 echo
 echo "인증서 종류"
@@ -43,11 +49,9 @@ read -rp "선택 [1-2]: " TYPE
 case "$TYPE" in
     1)
         TYPE_NAME="certbot"
-        CERT_ROOT="/opt/npmplus/tls/certbot"
         ;;
     2)
         TYPE_NAME="custom"
-        CERT_ROOT="/opt/npmplus/tls/custom"
         ;;
     *)
         echo "[오류] 1 또는 2를 선택하세요."
@@ -64,259 +68,256 @@ fi
 
 CERTNAME="npm-${CERTNUM}"
 
-# --------------------------------------------------
-# 인증서 실제 경로
-# --------------------------------------------------
-
 if [[ "$TYPE_NAME" == "certbot" ]]; then
-    CERT_DIR="${CERT_ROOT}/live/${CERTNAME}"
+    NPM_CERT="/opt/npmplus/tls/certbot/live/${CERTNAME}"
 else
-    CERT_DIR="${CERT_ROOT}/${CERTNAME}"
+    NPM_CERT="/opt/npmplus/tls/custom/${CERTNAME}"
 fi
 
 echo
-echo "[확인]"
-echo "NPM Plus : $NPMID"
-echo "AdGuard  : $ADGID"
-echo "종류     : $TYPE_NAME"
-echo "인증서   : $CERTNAME"
-echo "경로     : $CERT_DIR"
+echo "=================================================="
+echo "설정 확인"
+echo "=================================================="
+echo "NPM Plus LXC : $NPMID"
+echo "AdGuard LXC  : $ADGID"
+echo "종류         : $TYPE_NAME"
+echo "인증서       : $CERTNAME"
+echo "경로         : $NPM_CERT"
+echo "=================================================="
 echo
 
-if ! pct exec "$NPMID" -- test -f "${CERT_DIR}/fullchain.pem"; then
+# --------------------------------------------------
+# 인증서 존재 확인
+# --------------------------------------------------
+
+if ! pct exec "$NPMID" -- test -f "$NPM_CERT/fullchain.pem"; then
     echo "[오류] fullchain.pem을 찾을 수 없습니다:"
-    echo "${CERT_DIR}/fullchain.pem"
+    echo "$NPM_CERT/fullchain.pem"
     exit 1
 fi
 
-if ! pct exec "$NPMID" -- test -f "${CERT_DIR}/privkey.pem"; then
+if ! pct exec "$NPMID" -- test -f "$NPM_CERT/privkey.pem"; then
     echo "[오류] privkey.pem을 찾을 수 없습니다:"
-    echo "${CERT_DIR}/privkey.pem"
+    echo "$NPM_CERT/privkey.pem"
     exit 1
 fi
 
-echo "[OK] 인증서 확인"
+echo "[OK] NPM Plus 인증서 확인"
 
 # --------------------------------------------------
-# Host 저장 위치
+# AdGuard 인증서 디렉터리
 # --------------------------------------------------
 
-HOST_CERT_DIR="${BASE}/${TYPE_NAME}"
+ADG_CERT_DIR="/etc/adguardhome/certs"
 
 echo
-echo "[1/6] NPM Plus 인증서 저장소를 Host로 복사..."
+echo "[1/7] AdGuard Home 인증서 디렉터리 생성..."
 
-TMP_DIR="${HOST_CERT_DIR}.tmp"
+pct exec "$ADGID" -- mkdir -p "$ADG_CERT_DIR"
 
-rm -rf "$TMP_DIR"
-mkdir -p "$TMP_DIR"
+# --------------------------------------------------
+# SSH 서버 확인
+# --------------------------------------------------
 
-if [[ "$TYPE_NAME" == "certbot" ]]; then
+echo
+echo "[2/7] AdGuard Home SSH 서버 확인..."
 
-    # certbot은 live → archive 심볼릭 링크 구조이므로
-    # certbot 전체를 복사한다.
-    pct exec "$NPMID" -- tar \
-        -C "$CERT_ROOT" \
-        -cpf - . \
-        | tar -C "$TMP_DIR" -xpf -
+if ! pct exec "$ADGID" -- sh -c 'command -v sshd >/dev/null 2>&1'; then
+    echo "[INFO] AdGuard Home에 OpenSSH Server 설치..."
 
+    pct exec "$ADGID" -- apk add --no-cache openssh
+
+    pct exec "$ADGID" -- ssh-keygen -A
+
+    pct exec "$ADGID" -- rc-update add sshd default 2>/dev/null || true
+    pct exec "$ADGID" -- rc-service sshd start 2>/dev/null || true
 else
-
-    # custom은 해당 인증서 하나만 복사
-    mkdir -p "${TMP_DIR}/${CERTNAME}"
-
-    pct exec "$NPMID" -- tar \
-        -C "$CERT_ROOT" \
-        -cpf - "${CERTNAME}" \
-        | tar -C "$TMP_DIR" -xpf -
-
+    pct exec "$ADGID" -- rc-service sshd start 2>/dev/null || true
 fi
 
-rm -rf "$HOST_CERT_DIR"
-mv "$TMP_DIR" "$HOST_CERT_DIR"
+# --------------------------------------------------
+# NPM Plus SSH client
+# --------------------------------------------------
 
-echo "[OK] Host 저장소 생성:"
-echo "$HOST_CERT_DIR"
+echo
+echo "[3/7] NPM Plus SSH client 확인..."
+
+if ! pct exec "$NPMID" -- sh -c 'command -v ssh >/dev/null 2>&1 && command -v scp >/dev/null 2>&1'; then
+    echo "[INFO] NPM Plus에 OpenSSH client 설치..."
+
+    pct exec "$NPMID" -- apk add --no-cache openssh-client
+fi
 
 # --------------------------------------------------
-# 실제 인증서 파일 재확인
+# SSH Key 생성
 # --------------------------------------------------
+
+echo
+echo "[4/7] NPM Plus → AdGuard SSH 인증 설정..."
+
+NPM_SSH_DIR="/root/.ssh"
+
+pct exec "$NPMID" -- mkdir -p "$NPM_SSH_DIR"
+pct exec "$NPMID" -- chmod 700 "$NPM_SSH_DIR"
+
+if ! pct exec "$NPMID" -- test -f \
+    "${NPM_SSH_DIR}/id_ed25519_adguard"; then
+
+    pct exec "$NPMID" -- ssh-keygen \
+        -t ed25519 \
+        -N "" \
+        -f "${NPM_SSH_DIR}/id_ed25519_adguard" \
+        -C "npmplus-to-adguard"
+fi
+
+PUBKEY="$(pct exec "$NPMID" -- cat \
+    "${NPM_SSH_DIR}/id_ed25519_adguard.pub")"
+
+pct exec "$ADGID" -- mkdir -p /root/.ssh
+pct exec "$ADGID" -- chmod 700 /root/.ssh
+
+# 기존 동일 키 제거 후 추가
+pct exec "$ADGID" -- sh -c \
+    "touch /root/.ssh/authorized_keys && \
+     sed -i '/npmplus-to-adguard/d' /root/.ssh/authorized_keys && \
+     printf '%s\n' '$PUBKEY' >> /root/.ssh/authorized_keys && \
+     chmod 600 /root/.ssh/authorized_keys"
+
+# --------------------------------------------------
+# AdGuard SSH 주소
+# --------------------------------------------------
+
+ADG_IP="$(pct config "$ADGID" | sed -n 's/.*ip=\([^,\/]*\).*/\1/p')"
+
+if [[ -z "$ADG_IP" ]]; then
+    echo "[오류] AdGuard Home LXC IP를 자동으로 찾지 못했습니다."
+    echo
+    echo "현재 네트워크 설정:"
+    pct config "$ADGID" | grep '^net'
+    exit 1
+fi
+
+echo
+echo "AdGuard Home IP: $ADG_IP"
+
+# --------------------------------------------------
+# SSH known_hosts
+# --------------------------------------------------
+
+pct exec "$NPMID" -- mkdir -p /root/.ssh
+
+pct exec "$NPMID" -- sh -c \
+    "ssh-keyscan -H '$ADG_IP' >> /root/.ssh/known_hosts 2>/dev/null || true"
+
+# --------------------------------------------------
+# 최초 인증서 복사
+# --------------------------------------------------
+
+echo
+echo "[5/7] 최초 인증서 복사..."
+
+pct exec "$NPMID" -- sh -c "
+    scp \
+    -i /root/.ssh/id_ed25519_adguard \
+    -q \
+    '$NPM_CERT/fullchain.pem' \
+    root@'$ADG_IP':'$ADG_CERT_DIR'/fullchain.pem
+"
+
+pct exec "$NPMID" -- sh -c "
+    scp \
+    -i /root/.ssh/id_ed25519_adguard \
+    -q \
+    '$NPM_CERT/privkey.pem' \
+    root@'$ADG_IP':'$ADG_CERT_DIR'/privkey.pem
+"
+
+pct exec "$ADGID" -- chmod 644 \
+    "${ADG_CERT_DIR}/fullchain.pem"
+
+pct exec "$ADGID" -- chmod 600 \
+    "${ADG_CERT_DIR}/privkey.pem"
+
+echo "[OK] 최초 인증서 복사 완료"
+
+# --------------------------------------------------
+# Deploy Hook
+# --------------------------------------------------
+
+echo
+echo "[6/7] Certbot deploy hook 설치..."
 
 if [[ "$TYPE_NAME" == "certbot" ]]; then
-    HOST_CERT_DIR_FOR_CHECK="${HOST_CERT_DIR}/live/${CERTNAME}"
-else
-    HOST_CERT_DIR_FOR_CHECK="${HOST_CERT_DIR}/${CERTNAME}"
+
+    HOOK_DIR="/opt/npmplus/tls/certbot/renewal-hooks/deploy"
+
+    pct exec "$NPMID" -- mkdir -p "$HOOK_DIR"
+
+    HOOK="${HOOK_DIR}/99-adguard-${ADGID}-${CERTNUM}.sh"
+
+    pct exec "$NPMID" -- sh -c "cat > '$HOOK' <<'HOOKEOF'
+#!/bin/sh
+
+ADGUARD_IP='$ADG_IP'
+ADGUARD_CERT_DIR='$ADG_CERT_DIR'
+CERTNAME='$CERTNAME'
+
+# Certbot이 실제로 갱신한 인증서인지 확인
+if [ -n \"\$RENEWED_LINEAGE\" ] && \
+   [ \"\$RENEWED_LINEAGE\" = \"/opt/npmplus/tls/certbot/live/\$CERTNAME\" ]; then
+
+    scp \
+        -i /root/.ssh/id_ed25519_adguard \
+        -q \
+        \"\$RENEWED_LINEAGE/fullchain.pem\" \
+        root@\$ADGUARD_IP:\$ADGUARD_CERT_DIR/fullchain.pem || exit 1
+
+    scp \
+        -i /root/.ssh/id_ed25519_adguard \
+        -q \
+        \"\$RENEWED_LINEAGE/privkey.pem\" \
+        root@\$ADGUARD_IP:\$ADGUARD_CERT_DIR/privkey.pem || exit 1
+
+    ssh \
+        -i /root/.ssh/id_ed25519_adguard \
+        root@\$ADGUARD_IP \
+        'chmod 644 /etc/adguardhome/certs/fullchain.pem && chmod 600 /etc/adguardhome/certs/privkey.pem'
+
+    ssh \
+        -i /root/.ssh/id_ed25519_adguard \
+        root@\$ADGUARD_IP \
+        'systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome'
+
 fi
+HOOKEOF
+chmod 700 '$HOOK'"
 
-if [[ ! -f "${HOST_CERT_DIR_FOR_CHECK}/fullchain.pem" ]]; then
-    echo "[오류] Host에서 fullchain.pem을 찾을 수 없습니다."
-    exit 1
-fi
-
-if [[ ! -f "${HOST_CERT_DIR_FOR_CHECK}/privkey.pem" ]]; then
-    echo "[오류] Host에서 privkey.pem을 찾을 수 없습니다."
-    exit 1
-fi
-
-# --------------------------------------------------
-# NPM Plus mount
-# --------------------------------------------------
-
-echo
-echo "[2/6] NPM Plus 인증서 저장소 bind mount..."
-
-NPM_MP=""
-
-for i in $(seq 0 255); do
-    if ! pct config "$NPMID" | grep -q "^mp${i}:"; then
-        NPM_MP="mp${i}"
-        break
-    fi
-done
-
-if [[ -z "$NPM_MP" ]]; then
-    echo "[오류] NPM Plus에서 사용 가능한 mount point가 없습니다."
-    exit 1
-fi
-
-pct set "$NPMID" \
-    "-${NPM_MP}" "${HOST_CERT_DIR},mp=${CERT_ROOT}"
-
-echo "[OK] NPM Plus:"
-echo "  ${HOST_CERT_DIR}"
-echo "       ↓"
-echo "  ${CERT_ROOT}"
-
-# --------------------------------------------------
-# AdGuard mount
-# --------------------------------------------------
-
-echo
-echo "[3/6] AdGuard Home bind mount..."
-
-ADG_MP=""
-
-for i in $(seq 0 255); do
-    if ! pct config "$ADGID" | grep -q "^mp${i}:"; then
-        ADG_MP="mp${i}"
-        break
-    fi
-done
-
-if [[ -z "$ADG_MP" ]]; then
-    echo "[오류] AdGuard Home에서 사용 가능한 mount point가 없습니다."
-    exit 1
-fi
-
-ADG_PATH="/certs/${TYPE_NAME}"
-
-pct set "$ADGID" \
-    "-${ADG_MP}" "${HOST_CERT_DIR},mp=${ADG_PATH},ro=1"
-
-echo "[OK] AdGuard Home:"
-echo "  ${HOST_CERT_DIR}"
-echo "       ↓"
-echo "  ${ADG_PATH}"
-
-# --------------------------------------------------
-# NPM 갱신 후 AdGuard 자동 reload
-# --------------------------------------------------
-
-echo
-echo "[4/6] NPM Plus 인증서 갱신 Hook 설정..."
-
-if [[ "$TYPE_NAME" == "certbot" ]]; then
-
-    HOOK_DIR="${HOST_CERT_DIR}/renewal-hooks/deploy"
-    mkdir -p "$HOOK_DIR"
-
-    HOOK="${HOOK_DIR}/99-adguard-${ADGID}.sh"
-
-    cat > "$HOOK" <<EOF
-#!/usr/bin/env bash
-
-ADGID="${ADGID}"
-CERTNAME="${CERTNAME}"
-
-if [[ -n "\${RENEWED_LINEAGE:-}" ]] && \
-   [[ "\${RENEWED_LINEAGE}" == *"/\${CERTNAME}" ]]; then
-
-    if pct status "\$ADGID" 2>/dev/null | grep -q "status: running"; then
-        pct exec "\$ADGID" -- systemctl reload AdGuardHome 2>/dev/null || \
-        pct exec "\$ADGID" -- systemctl restart AdGuardHome 2>/dev/null || true
-    fi
-fi
-EOF
-
-    chmod 700 "$HOOK"
-
-    echo "[OK] Certbot deploy hook 생성:"
+    echo "[OK] Deploy hook 설치:"
     echo "$HOOK"
 
 else
 
-    echo "[INFO] custom 인증서는 자동 갱신 Hook을 만들지 않습니다."
-    echo "       custom 인증서가 외부에서 갱신되는 경우 해당 시스템에서"
-    echo "       AdGuardHome reload가 필요합니다."
+    echo "[INFO] custom 인증서는 Certbot 자동 갱신 Hook을 설치하지 않습니다."
 
 fi
 
 # --------------------------------------------------
-# 컨테이너 재시작
+# 테스트
 # --------------------------------------------------
 
 echo
-echo "[5/6] 컨테이너 재시작..."
+echo "[7/7] SSH 연결 테스트..."
 
-if pct status "$NPMID" | grep -q "status: running"; then
-    pct reboot "$NPMID"
-    sleep 5
-fi
+pct exec "$NPMID" -- sh -c \
+    "ssh \
+     -i /root/.ssh/id_ed25519_adguard \
+     -o BatchMode=yes \
+     root@'$ADG_IP' \
+     'echo SSH_OK'"
 
-if pct status "$ADGID" | grep -q "status: running"; then
-    pct reboot "$ADGID"
-    sleep 5
-fi
-
-# --------------------------------------------------
-# AdGuard에서 실제 파일 확인
-# --------------------------------------------------
-
-echo
-echo "[6/6] AdGuard Home 인증서 확인..."
-
-if [[ "$TYPE_NAME" == "certbot" ]]; then
-    ADG_CERT_DIR="${ADG_PATH}/live/${CERTNAME}"
-else
-    ADG_CERT_DIR="${ADG_PATH}/${CERTNAME}"
-fi
-
-if ! pct exec "$ADGID" -- test -f \
-    "${ADG_CERT_DIR}/fullchain.pem"; then
-
-    echo "[오류] AdGuard Home에서 fullchain.pem을 찾지 못했습니다:"
-    echo "${ADG_CERT_DIR}/fullchain.pem"
-    exit 1
-fi
-
-if ! pct exec "$ADGID" -- test -f \
-    "${ADG_CERT_DIR}/privkey.pem"; then
-
-    echo "[오류] AdGuard Home에서 privkey.pem을 찾지 못했습니다:"
-    echo "${ADG_CERT_DIR}/privkey.pem"
-    exit 1
-fi
-
-echo "[OK] AdGuard Home에서 인증서 확인"
-
-# --------------------------------------------------
-# 최종 출력
-# --------------------------------------------------
-
-echo
 echo
 echo "=============================================================="
-echo "                    설정 완료"
+echo "                  설정 완료"
 echo "=============================================================="
 echo
 echo "NPM Plus LXC       : $NPMID"
@@ -324,20 +325,19 @@ echo "AdGuard Home LXC   : $ADGID"
 echo "인증서 종류        : $TYPE_NAME"
 echo "인증서 번호        : $CERTNAME"
 echo
-echo "AdGuard Home → Settings → Encryption"
+echo "AdGuard Home 인증서:"
+echo "$ADG_CERT_DIR/fullchain.pem"
 echo
-
-echo "Certificate Path:"
-echo "${ADG_CERT_DIR}/fullchain.pem"
-echo
-
-echo "Private Key Path:"
-echo "${ADG_CERT_DIR}/privkey.pem"
+echo "AdGuard Home 개인키:"
+echo "$ADG_CERT_DIR/privkey.pem"
 echo
 echo "=============================================================="
 echo
-echo "인증서는 NPM Plus와 AdGuard Home이 동일 파일을 사용합니다."
-echo "Certbot 갱신 시 AdGuard Home도 자동 reload 됩니다."
-echo "주기적인 인증서 복사 작업은 사용하지 않습니다."
+echo "자동 갱신:"
+echo "NPM Plus Certbot → Deploy Hook → AdGuard Home"
+echo
+echo "주기적 polling 없음"
+echo "LXC bind mount 없음"
+echo "NPM Plus 인증서 저장소 변경 없음"
 echo "=============================================================="
 echo
