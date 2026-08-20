@@ -45,12 +45,21 @@ hook_lines() {
 }
 show_hooks() {
     local npm=$1 line hook adg cert i=0
+    section "등록된 Deploy Hook · NPM LXC $npm"
     while IFS='|' read -r hook adg cert; do
         i=$((i + 1))
         printf '%2d) NPM LXC: %s | AdGuard LXC: %s | 인증서: npm-%s\n' "$i" "$npm" "$adg" "$cert"
         printf '    Hook: %s/%s\n' "$HOOK_DIR" "$hook"
+        if [[ $(file_digest "$npm" "/opt/npmplus/tls/certbot/live/npm-$cert/fullchain.pem") == $(file_digest "$adg" "$ADG_CERT_DIR/fullchain.pem") ]]; then
+            echo "    동기화: 일치"
+        else
+            echo "    동기화: 불일치 · 메뉴 4) 테스트로 강제 반영하세요."
+        fi
     done < <(hook_lines "$npm")
     (( i > 0 )) || { echo "[INFO] AdGuard Deploy Hook이 없습니다."; return 1; }
+    echo
+    echo "최근 Hook 실행 로그: /var/log/npmplus-adguard-deploy.log"
+    pct exec "$npm" -- sh -c 'tail -n 5 /var/log/npmplus-adguard-deploy.log 2>/dev/null || echo "  (아직 실행 기록 없음)"'
 }
 select_hook() {
     local npm pick count line
@@ -93,6 +102,16 @@ setup_ssh() {
         sed -i '/npmplus-to-adguard/d' /root/.ssh/authorized_keys &&
         printf '%s\n' '$pub' >> /root/.ssh/authorized_keys &&
         chmod 600 /root/.ssh/authorized_keys"
+}
+file_digest() {
+    local ctid=$1 path=$2
+    pct exec "$ctid" -- sh -c "
+        if [ -f '$path' ]; then
+            (sha256sum '$path' 2>/dev/null || busybox sha256sum '$path') | awk '{print \$1}'
+        else
+            printf '%s' '없음'
+        fi
+    "
 }
 
 # 두 파일을 .tmp로 전송한 뒤에만 원격에서 교체·권한 변경·reload합니다.
@@ -174,7 +193,9 @@ IP='$ip'
 DEST='$ADG_CERT_DIR'
 LINEAGE='/opt/npmplus/tls/certbot/live/npm-$cert'
 KEY='$SSH_KEY'
-[ \"\$RENEWED_LINEAGE\" = \"\$LINEAGE\" ] 2>/dev/null || exit 0
+LOG=/var/log/npmplus-adguard-deploy.log
+printf '%s | hook=%s | renewed_lineage=%s\\n' \"\$(date '+%F %T')\" \"\$0\" \"\${RENEWED_LINEAGE:-없음}\" >> \"\$LOG\"
+[ \"\${RENEWED_LINEAGE:-}\" = \"\$LINEAGE\" ] || exit 0
 scp -i \"\$KEY\" -q \"\$LINEAGE/fullchain.pem\" root@\"\$IP\":\"\$DEST\"/fullchain.pem.tmp
 scp -i \"\$KEY\" -q \"\$LINEAGE/privkey.pem\" root@\"\$IP\":\"\$DEST\"/privkey.pem.tmp
 ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
@@ -191,6 +212,7 @@ ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
   else
     echo 'AdGuardHome 서비스 관리 명령을 찾을 수 없습니다.' >&2; exit 1;
   fi\"
+printf '%s | npm-$cert -> AdGuard 반영 완료\\n' \"\$(date '+%F %T')\" >> \"\$LOG\"
 "
     b64="$(printf '%s' "$content" | base64 | tr -d '\n')"
     pct exec "$npm" -- sh -c "printf '%s' '$b64' | base64 -d > '$target' && chmod 700 '$target'"
@@ -198,9 +220,13 @@ ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
 
 install() {
     local npm adg type cert base source ip answer tls_mode line hook old_adg old_cert duplicates=""
+    section "연결 정보 입력"
     read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"
     read -rp "AdGuard Home LXC 번호: " adg; check_ct "$adg"
-    echo "인증서 종류: 1) certbot  2) custom"
+    echo
+    echo "인증서 종류"
+    echo "  1) Certbot / Let's Encrypt · 자동 갱신"
+    echo "  2) Custom · 최초 복사만"
     read -rp "선택 [1-2]: " type
     case "$type" in 1) base=/opt/npmplus/tls/certbot/live;; 2) base=/opt/npmplus/tls/custom;; *) echo "[오류] 1 또는 2를 선택하세요."; return 1;; esac
     read -rp "인증서 번호 (예: 1): " cert
@@ -208,6 +234,11 @@ install() {
     source="$base/npm-$cert"
     pct exec "$npm" -- test -f "$source/fullchain.pem" || { echo "[오류] fullchain.pem을 찾을 수 없습니다."; return 1; }
     pct exec "$npm" -- test -f "$source/privkey.pem" || { echo "[오류] privkey.pem을 찾을 수 없습니다."; return 1; }
+    section "선택한 연결 정보"
+    field "NPM Plus LXC" "$npm"
+    field "AdGuard Home LXC" "$adg"
+    field "인증서" "npm-$cert"
+    field "원본 경로" "$source"
     if [[ $type == 1 ]]; then
         while IFS='|' read -r hook old_adg old_cert; do
             [[ $old_adg == "$adg" && $old_cert == "$cert" ]] && duplicates="$duplicates$hook"$'\n'
@@ -219,10 +250,11 @@ install() {
             [[ $answer =~ ^[Yy]$ ]] || { echo "[INFO] 설치를 취소했습니다."; return 0; }
         fi
     fi
-    echo "[1/7] AdGuard Home 인증서 디렉터리 생성..."
+    section "설치 진행"
+    echo "[1/7] AdGuard Home 인증서 디렉터리 생성"
     pct exec "$adg" -- mkdir -p "$ADG_CERT_DIR"
     setup_ssh "$npm" "$adg"
-    ip="$(get_ip "$adg")"; echo "AdGuard Home IP: $ip"
+    ip="$(get_ip "$adg")"; field "AdGuard Home IP" "$ip"
     pct exec "$npm" -- sh -c "ssh-keyscan -H '$ip' >> /root/.ssh/known_hosts 2>/dev/null || true"
     echo
     echo "AdGuard Home TLS 인증서 경로 등록"
@@ -233,14 +265,14 @@ install() {
         1|2) ;;
         *) echo "[오류] 1 또는 2를 선택하세요."; return 1 ;;
     esac
-    echo "[5/7] 최초 인증서 Atomic Copy..."
+    echo "[5/7] 최초 인증서 Atomic Copy"
     copy_atomic "$npm" "$source" "$ip"
     if [[ $tls_mode == 1 ]]; then
         register_tls_paths "$adg"
     else
         echo "[INFO] TLS 경로는 수동 등록으로 선택했습니다."
     fi
-    echo "[6/7] Certbot deploy hook 설치..."
+    echo "[6/7] Certbot deploy hook 설치"
     if [[ $type == 1 ]]; then
         pct exec "$npm" -- mkdir -p "$HOOK_DIR"
         if [[ -n $duplicates ]]; then
@@ -252,16 +284,22 @@ install() {
     else
         echo "[INFO] custom 인증서는 기존 동작과 같이 Certbot Hook을 만들지 않습니다."
     fi
-    echo "[7/7] SSH 연결 테스트..."
+    echo "[7/7] SSH 연결 테스트"
     pct exec "$npm" -- sh -c "ssh -i '$SSH_KEY' -o BatchMode=yes root@'$ip' 'echo SSH_OK'"
-    echo "[완료] polling, cron, bind mount 없이 자동 연동을 설정했습니다."
-    echo "AdGuard Home 인증서 경로: $ADG_CERT_DIR/fullchain.pem"
-    echo "AdGuard Home 개인키 경로:   $ADG_CERT_DIR/privkey.pem"
+    section "설정 완료"
+    echo "[OK] polling, cron, bind mount 없이 자동 연동을 설정했습니다."
+    field "인증서 경로" "$ADG_CERT_DIR/fullchain.pem"
+    field "개인키 경로" "$ADG_CERT_DIR/privkey.pem"
     if [[ $tls_mode == 2 ]]; then
         echo "수동 등록: TLS certificate_chain/private_key는 비우고, certificate_path/private_key_path에 위 경로를 입력하세요."
     fi
 }
-status() { local npm; read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"; show_hooks "$npm" || true; }
+status() {
+    local npm
+    section "연결 상태 조회"
+    read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"
+    show_hooks "$npm" || true
+}
 remove_hook() {
     local answer
     select_hook || return 0
@@ -272,10 +310,22 @@ remove_hook() {
     echo "[OK] Hook만 삭제했습니다. 인증서, SSH Key, authorized_keys는 유지했습니다."
 }
 test_hook() {
+    local source_digest before_digest after_digest
     select_hook || return 0
-    echo "[TEST] $HOOK_DIR/$SEL_HOOK 강제 실행..."
+    section "Deploy Hook 강제 테스트"
+    field "Hook" "$HOOK_DIR/$SEL_HOOK"
+    field "대상 AdGuard LXC" "$SEL_ADG"
+    source_digest="$(file_digest "$SEL_NPM" "/opt/npmplus/tls/certbot/live/npm-$SEL_CERT/fullchain.pem")"
+    before_digest="$(file_digest "$SEL_ADG" "$ADG_CERT_DIR/fullchain.pem")"
+    field "NPM 인증서 SHA-256" "$source_digest"
+    field "AdGuard 이전 SHA-256" "$before_digest"
+    echo
+    echo "[TEST] Hook 실행 및 AdGuard reload"
     pct exec "$SEL_NPM" -- env "RENEWED_LINEAGE=/opt/npmplus/tls/certbot/live/npm-$SEL_CERT" sh "$HOOK_DIR/$SEL_HOOK"
-    echo "[OK] Hook 실행 완료"
+    after_digest="$(file_digest "$SEL_ADG" "$ADG_CERT_DIR/fullchain.pem")"
+    field "AdGuard 이후 SHA-256" "$after_digest"
+    [[ $source_digest == "$after_digest" ]] || die "인증서 내용이 일치하지 않습니다. SSH/SCP 또는 Hook 오류를 확인하세요."
+    echo "[OK] 인증서 복사와 AdGuard reload가 정상 처리되었습니다."
 }
 main() {
     local choice
@@ -284,8 +334,13 @@ main() {
         echo; echo "=================================================="
         echo " NPM Plus → AdGuard Home 인증서 자동 연동"
         echo "=================================================="
-        echo "1) 설치"; echo "2) 상태 조회"; echo "3) 제거"; echo "4) 테스트"; echo "5) 종료"
-        read -rp "선택 [1-5]: " choice
+        echo "  1) 새 연결 설치"
+        echo "  2) 연결 상태 조회"
+        echo "  3) 연결 제거 · Hook만 삭제"
+        echo "  4) Deploy Hook 테스트"
+        echo "  5) 종료"
+        echo
+        read -rp "메뉴 선택 [1-5]: " choice
         case "$choice" in
             1) install;; 2) status;; 3) remove_hook;; 4) test_hook;;
             5) echo "종료합니다."; exit 0;;
