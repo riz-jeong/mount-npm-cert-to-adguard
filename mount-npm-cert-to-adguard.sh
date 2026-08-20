@@ -575,8 +575,12 @@ remove_mapping_flow() {
         rm -f \"$SYNC_DIR/state/\$(printf '%s' '$elabel' | tr '/ ' '__').digest\"
     "
     ok "연동을 제거했습니다. AdGuard의 인증서 파일, SSH Key는 유지됩니다."
-    remaining="$(pct exec "$npm" -- sh -c "grep -c '|' '$MAP_FILE_REMOTE' 2>/dev/null || echo 0")"
-    if [[ ${remaining:-0} -eq 0 ]]; then
+    remaining="$(pct exec "$npm" -- sh -c "
+        cnt=\$(grep -c '|' '$MAP_FILE_REMOTE' 2>/dev/null || true)
+        printf '%s' \"\${cnt:-0}\"
+    ")"
+    remaining=${remaining:-0}
+    if [[ "$remaining" -eq 0 ]]; then
         read -rp "남은 연동이 없습니다. 감시 서비스도 중지할까요? (Y/N): " answer
         if [[ $answer =~ ^[Yy]$ ]]; then
             pct exec "$npm" -- rc-service adguard-cert-sync stop || true
