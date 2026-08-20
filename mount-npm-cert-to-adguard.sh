@@ -4,7 +4,7 @@ set -euo pipefail
 # =====================================================================
 # NPM Plus -> AdGuard Home 인증서 실시간 연동
 # =====================================================================
-# bind mount, cron, 원격 polling을 사용하지 않습니다.
+# bind mount, cron, 원격 polling을 사용하지 않음
 # =====================================================================
 
 ADG_CERT_DIR=/etc/adguardhome/certs
@@ -12,7 +12,6 @@ SSH_KEY=/root/.ssh/id_ed25519_adguard
 SYNC_DIR=/opt/npmplus/tls/.adguard-sync
 MAP_FILE_REMOTE="$SYNC_DIR/mappings.conf"
 LOG_REMOTE=/var/log/npmplus-adguard-deploy.log
-LEGACY_HOOK_DIR=/opt/npmplus/tls/certbot/renewal-hooks/deploy
 
 # ------------------------------- 출력 도우미 -------------------------------
 if [[ -t 1 ]] && [[ -z ${NO_COLOR:-} ]]; then
@@ -190,7 +189,7 @@ setup_ssh() {
         pct exec "$adg" -- ssh-keygen -A
     fi
     # 최신 scp는 SFTP를 사용합니다. 외부 sftp-server 패키지에 의존하지 않는
-    # OpenSSH 내장 internal-sftp를 명시해 Alpine에서 전송 프로토콜을 보장합니다.
+    # OpenSSH 내장 internal-sftp를 명시해 Alpine에서 전송 프로토콜을 보장
     pct exec "$adg" -- sh -c '
         config=/etc/ssh/sshd_config
         if grep -q "^[[:space:]]*Subsystem[[:space:]][[:space:]]*sftp[[:space:]]" "$config"; then
@@ -226,7 +225,7 @@ setup_ssh() {
         chmod 600 /root/.ssh/authorized_keys"
 }
 
-# 두 파일을 .tmp로 전송한 뒤에만 원격에서 교체·권한 변경·reload합니다.
+# 두 파일을 .tmp로 전송한 뒤에만 원격에서 교체·권한 변경·reload
 copy_atomic() {
     local npm=$1 source=$2 ip=$3
     pct exec "$npm" -- sh -c "
@@ -452,6 +451,8 @@ deploy_watcher() {
     rm -rf "$tmp"
 }
 add_mapping() {
+    # 같은 인증서(src)를 여러 AdGuard(ctid)에 연결 가능
+    # 고유 키: src|ctid|
     local npm=$1 src=$2 ctid=$3 ip=$4 label=$5
     local esrc ectid eip elabel
     esrc=$(sq_escape "$src")
@@ -460,18 +461,10 @@ add_mapping() {
     elabel=$(sq_escape "$label")
     pct exec "$npm" -- sh -c "
         touch '$MAP_FILE_REMOTE'
-        grep -vF '$esrc|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
+        grep -vF '$esrc|$ectid|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
         printf '%s|%s|%s|%s\n' '$esrc' '$ectid' '$eip' '$elabel' >> '$MAP_FILE_REMOTE.new'
         mv '$MAP_FILE_REMOTE.new' '$MAP_FILE_REMOTE'
     "
-}
-migrate_legacy_hooks() {
-    local npm=$1 adg=$2 cert=$3
-    local target="$LEGACY_HOOK_DIR/99-adguard-$npm-$adg-$cert.sh"
-    if pct exec "$npm" -- test -f "$target" 2>/dev/null; then
-        pct exec "$npm" -- rm -f "$target"
-        info "이전 버전에서 만든 certbot deploy hook을 제거했습니다 (더 이상 필요하지 않습니다)."
-    fi
 }
 
 # ------------------------------- 매핑 목록 -------------------------------
@@ -510,11 +503,17 @@ install() {
     field "인증서" "npm-$PICK_NUM ($PICK_DOMAIN)"
     field "원본 경로" "$PICK_PATH"
 
-    existing="$(pct exec "$npm" -- sh -c "grep -F '$PICK_PATH|' '$MAP_FILE_REMOTE' 2>/dev/null || true")"
+    # 같은 인증서+같은 AdGuard만 중복으로 취급 (다른 AdGuard로의 연동은 허용)
+    existing="$(pct exec "$npm" -- sh -c "grep -F '$PICK_PATH|$adg|' '$MAP_FILE_REMOTE' 2>/dev/null || true")"
     if [[ -n $existing ]]; then
-        info "이미 이 인증서에 대한 연동이 등록되어 있습니다: $existing"
+        info "이미 이 인증서→AdGuard LXC $adg 연동이 등록되어 있습니다: $existing"
         read -rp "덮어쓸까요? (Y/N): " answer
         [[ $answer =~ ^[Yy]$ ]] || { info "설치를 취소했습니다."; return 0; }
+    fi
+    other="$(pct exec "$npm" -- sh -c "grep -F '$PICK_PATH|' '$MAP_FILE_REMOTE' 2>/dev/null | grep -vF '$PICK_PATH|$adg|' || true")"
+    if [[ -n $other ]]; then
+        info "같은 인증서가 다른 AdGuard에도 연결되어 있습니다 (병행 가능):"
+        printf '%s\n' "$other" | while IFS= read -r line; do info "  $line"; done
     fi
 
     section "설치 진행"
@@ -549,7 +548,6 @@ install() {
     fi
     add_mapping "$npm" "$PICK_PATH" "$adg" "$ip" "$label"
     ok "감시 서비스가 실행 중이며 인증서 변경을 실시간으로 감지합니다."
-    migrate_legacy_hooks "$npm" "$adg" "$PICK_NUM"
 
     echo "[7/7] SSH 연결 테스트"
     pct exec "$npm" -- sh -c "ssh -i '$SSH_KEY' -o BatchMode=yes root@'$ip' 'echo SSH_OK'" >/dev/null
@@ -612,15 +610,16 @@ remove_mapping_flow() {
     echo "삭제 대상: $sel_label"
     read -rp "삭제할까요? (Y/N): " answer
     [[ $answer =~ ^[Yy]$ ]] || { info "취소했습니다."; return 0; }
-    local esrc elabel
+    local esrc ectid elabel
     esrc=$(sq_escape "$sel_src")
+    ectid=$(sq_escape "$sel_ctid")
     elabel=$(sq_escape "$sel_label")
     pct exec "$npm" -- sh -c "
-        grep -vF '$esrc|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
+        grep -vF '$esrc|$ectid|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
         mv '$MAP_FILE_REMOTE.new' '$MAP_FILE_REMOTE'
         rm -f \"$SYNC_DIR/state/\$(printf '%s' '$elabel' | tr '/ ' '__').digest\"
     "
-    ok "연동을 제거했습니다. AdGuard의 인증서 파일, SSH Key는 유지됩니다."
+    ok "연동을 제거했습니다. (다른 AdGuard 연동은 유지) AdGuard 인증서/SSH Key는 유지됩니다."
     remaining="$(pct exec "$npm" -- sh -c "
         cnt=\$(grep -c '|' '$MAP_FILE_REMOTE' 2>/dev/null || true)
         printf '%s' \"\${cnt:-0}\"
