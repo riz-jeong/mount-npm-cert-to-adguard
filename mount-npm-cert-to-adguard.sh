@@ -62,53 +62,54 @@ file_digest() {
 
 # ------------------------------- 인증서 탐색/선택 -------------------------------
 cert_domain() {
-    local ctid=$1 path=$2 out num conf
-    # 1) 인증서 Subject CN
-    out="$(pct exec "$ctid" -- sh -c "
-        openssl x509 -noout -subject -in '$path' 2>/dev/null |
-        sed -n -e 's/.*[Cc][Nn][[:space:]]*=[[:space:]]*//p' |
-        sed 's/,.*//' | head -n1
-    " 2>/dev/null || true)"
-    out="${out//$'\r'/}"
-    out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local ctid=$1 path=$2 out num pem
+    num=$(basename "$(dirname "$path")")
+    num=${num#npm-}
 
-    # 2) SAN (DNS:) — openssl 버전에 따라 -ext / -text 모두 시도
-    if [[ -z $out || $out == *"="* ]]; then
-        out="$(pct exec "$ctid" -- sh -c "
-            openssl x509 -noout -ext subjectAltName -in '$path' 2>/dev/null ||
-            openssl x509 -noout -text -in '$path' 2>/dev/null
-        " 2>/dev/null | sed -n 's/.*DNS:\([^, ]*\).*/\1/p' | head -n1 || true)"
-        out="${out//$'\r'/}"
-        out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    # 1) LXC에 openssl이 없는 경우가 많음 → 인증서 내용을 Host openssl로 파싱
+    if command -v openssl >/dev/null 2>&1; then
+        pem="$(pct exec "$ctid" -- cat "$path" 2>/dev/null || true)"
+        if [[ -z $pem ]]; then
+            pem="$(pct exec "$ctid" -- cat "/data/tls/certbot/live/npm-${num}/fullchain.pem" 2>/dev/null || true)"
+        fi
+        if [[ -n $pem ]]; then
+            out="$(printf '%s\n' "$pem" | openssl x509 -noout -subject 2>/dev/null |
+                sed -n -e 's/.*[Cc][Nn][[:space:]]*=[[:space:]]*//p' | sed 's/,.*//' | head -n1)"
+            out="${out//$'\r'/}"; out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if [[ -z $out || $out == *"="* ]]; then
+                out="$(printf '%s\n' "$pem" | openssl x509 -noout -text 2>/dev/null |
+                    sed -n 's/.*DNS:\([^, ]*\).*/\1/p' | head -n1)"
+                out="${out//$'\r'/}"; out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            fi
+        fi
     fi
 
-    # 3) renewal 설정 파일에서 도메인 추출 (webroot_map / domains)
+    # 2) NPM DB (certificate.domain_names) — DNS 인증서도 여기에 기록됨
     if [[ -z $out ]]; then
-        num=$(basename "$(dirname "$path")")
-        num=${num#npm-}
-        conf="/opt/npmplus/tls/certbot/renewal/npm-${num}.conf"
         out="$(pct exec "$ctid" -- sh -c "
-            for c in '$conf' /data/tls/certbot/renewal/npm-${num}.conf; do
+            for db in \
+                /opt/npmplus/npmplus/database.sqlite \
+                /opt/npmplus/data/npmplus/database.sqlite \
+                /data/npmplus/database.sqlite \
+                /data/database.sqlite; do
+                [ -f \"\$db\" ] || continue
+                if command -v sqlite3 >/dev/null 2>&1; then
+                    sqlite3 \"\$db\" \"SELECT domain_names FROM certificate WHERE id=${num} LIMIT 1;\" 2>/dev/null
+                fi
+            done
+        " 2>/dev/null | head -n1 || true)"
+        out="$(printf '%s' "$out" | sed -e 's/^\["*//' -e 's/"*\].*$//' -e 's/".*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    fi
+
+    # 3) renewal conf webroot_map (HTTP 인증서용, DNS면 비어 있을 수 있음)
+    if [[ -z $out ]]; then
+        out="$(pct exec "$ctid" -- sh -c "
+            for c in /opt/npmplus/tls/certbot/renewal/npm-${num}.conf /data/tls/certbot/renewal/npm-${num}.conf; do
                 [ -f \"\$c\" ] || continue
                 sed -n '/^\[\[webroot_map\]\]/,/^\[/p' \"\$c\" 2>/dev/null |
                     sed -n 's/^[[:space:]]*\([^[:space:]=]\+\)[[:space:]]*=.*/\1/p' | head -n1
-                grep -E '^[[:space:]]*domains[[:space:]]*=' \"\$c\" 2>/dev/null |
-                    sed 's/.*=[[:space:]]*//' | tr ',' '\n' | head -n1
             done
         " 2>/dev/null | head -n1 || true)"
-        out="${out//$'\r'/}"
-        out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    fi
-
-    # 4) cert.pem 재시도
-    if [[ -z $out ]]; then
-        local certpath="${path%/*}/cert.pem"
-        out="$(pct exec "$ctid" -- sh -c "
-            openssl x509 -noout -subject -in '$certpath' 2>/dev/null |
-            sed -n -e 's/.*[Cc][Nn][[:space:]]*=[[:space:]]*//p' |
-            sed 's/,.*//' | head -n1
-        " 2>/dev/null || true)"
-        out="${out//$'\r'/}"
         out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     fi
 
