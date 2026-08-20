@@ -316,24 +316,34 @@ push_one() {
 }
 
 # $RENEWED_LINEAGE 가 있으면 해당 인증서만, 없으면 전체
+# 경로 prefix가 /data 또는 /opt/npmplus 등으로 달라도 basename(npm-N)으로 매칭
 if [ -n "${RENEWED_LINEAGE:-}" ]; then
     log "[HOOK] certbot deploy: RENEWED_LINEAGE=$RENEWED_LINEAGE"
+    lineage_base=$(basename "${RENEWED_LINEAGE%/}")
     matched=0
     while IFS='|' read -r src ctid ip label; do
         case "$src" in ''|'#'*) continue;; esac
-        # lineage 경로와 매핑 src가 같으면 처리 (trailing slash 무시)
+        src_base=$(basename "${src%/}")
+        # 1) 전체 경로 일치  2) basename(npm-N) 일치
         src_norm=${src%/}
         lineage_norm=${RENEWED_LINEAGE%/}
-        if [ "$src_norm" = "$lineage_norm" ]; then
-            push_one "$src" "$ip" "$label" || true
+        if [ "$src_norm" = "$lineage_norm" ] || [ "$src_base" = "$lineage_base" ]; then
+            # 실제 파일이 있는 쪽을 소스로 사용 (RENEWED_LINEAGE 우선)
+            real_src=$src
+            if [ -f "$lineage_norm/fullchain.pem" ]; then
+                real_src=$lineage_norm
+            elif [ -f "$src_norm/fullchain.pem" ]; then
+                real_src=$src_norm
+            fi
+            push_one "$real_src" "$ip" "$label" || true
             matched=1
         fi
     done < "$MAP_FILE"
     if [ "$matched" -eq 0 ]; then
-        log "[HOOK] RENEWED_LINEAGE에 해당하는 매핑 없음 (무시)"
+        log "[HOOK] RENEWED_LINEAGE($lineage_base)에 해당하는 매핑 없음 (무시)"
     fi
 else
-    # 수동 실행 (--once 또는 직접 호출)
+    # 수동 실행 (강제 동기화)
     log "[MANUAL] 전체 매핑 강제 동기화"
     [ -s "$MAP_FILE" ] || { log "[MANUAL] 매핑 없음"; exit 0; }
     while IFS='|' read -r src ctid ip label; do
