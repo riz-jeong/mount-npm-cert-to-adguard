@@ -8,6 +8,9 @@ HOOK_DIR=/opt/npmplus/tls/certbot/renewal-hooks/deploy
 ADG_CERT_DIR=/etc/adguardhome/certs
 SSH_KEY=/root/.ssh/id_ed25519_adguard
 
+line() { printf '%s\n' '--------------------------------------------------'; }
+section() { echo; line; echo " $1"; line; }
+field() { printf ' %-16s %s\n' "$1:" "$2"; }
 die() { echo "[오류] $*" >&2; exit 1; }
 check_ct() {
     [[ $1 =~ ^[0-9]+$ ]] || die "LXC 번호는 숫자여야 합니다."
@@ -25,18 +28,14 @@ get_ip() {
 }
 
 # 출력 형식: Hook파일명|AdGuard LXC|인증서 번호
-# 신규 파일명: 99-adguard-NPMID-ADGID-CERTNUM.sh
-# 기존 파일명: 99-adguard-ADGID-CERTNUM.sh
+# 파일명: 99-adguard-NPMID-ADGID-CERTNUM.sh
 hook_lines() {
     local npm=$1 file a b c d e cert
     while IFS= read -r file; do
         IFS=- read -r a b c d e <<< "$file"
-        if [[ $e == *.sh && $a == 99 && $b == adguard && $c =~ ^[0-9]+$ && $d =~ ^[0-9]+$ ]]; then
+        if [[ $e == *.sh && $a == 99 && $b == adguard && $c == "$npm" && $d =~ ^[0-9]+$ ]]; then
             cert="$(printf '%s' "$e" | sed 's/\.sh$//')"
             [[ $cert =~ ^[0-9]+$ ]] && printf '%s|%s|%s\n' "$file" "$d" "$cert"
-        elif [[ $d == *.sh && $a == 99 && $b == adguard && $c =~ ^[0-9]+$ ]]; then
-            cert="$(printf '%s' "$d" | sed 's/\.sh$//')"
-            [[ $cert =~ ^[0-9]+$ ]] && printf '%s|%s|%s\n' "$file" "$c" "$cert"
         fi
     done < <(pct exec "$npm" -- sh -c '
         for f in /opt/npmplus/tls/certbot/renewal-hooks/deploy/99-adguard-*.sh; do
@@ -110,10 +109,10 @@ copy_atomic() {
           chmod 600 '$ADG_CERT_DIR/privkey.pem';
           if command -v systemctl >/dev/null 2>&1; then
             systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome;
-          elif [ -x /etc/init.d/AdGuardHome ]; then
-            rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart;
           elif [ -x /etc/init.d/adguardhome ]; then
             rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart;
+          elif [ -x /etc/init.d/AdGuardHome ]; then
+            rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart;
           else
             echo 'AdGuardHome 서비스 관리 명령을 찾을 수 없습니다.' >&2; exit 1;
           fi\"
@@ -124,10 +123,10 @@ reload_adguard() {
         set -eu
         if command -v systemctl >/dev/null 2>&1; then
             systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome
-        elif [ -x /etc/init.d/AdGuardHome ]; then
-            rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart
         elif [ -x /etc/init.d/adguardhome ]; then
             rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart
+        elif [ -x /etc/init.d/AdGuardHome ]; then
+            rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart
         else
             echo "AdGuardHome 서비스 관리 명령을 찾을 수 없습니다." >&2
             exit 1
@@ -136,7 +135,10 @@ reload_adguard() {
 }
 find_adguard_config() {
     pct exec "$1" -- sh -c '
-        for config in +            /opt/AdGuardHome/AdGuardHome.yaml +            /opt/adguardhome/AdGuardHome.yaml +            /etc/adguardhome/AdGuardHome.yaml; do
+        for config in \
+            /opt/AdGuardHome/AdGuardHome.yaml \
+            /opt/adguardhome/AdGuardHome.yaml \
+            /etc/adguardhome/AdGuardHome.yaml; do
             [ -f "$config" ] && { printf "%s\n" "$config"; exit 0; }
         done
         exit 1
@@ -182,10 +184,10 @@ ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
   chmod 600 '\$DEST/privkey.pem';
   if command -v systemctl >/dev/null 2>&1; then
     systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome;
-  elif [ -x /etc/init.d/AdGuardHome ]; then
-    rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart;
   elif [ -x /etc/init.d/adguardhome ]; then
     rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart;
+  elif [ -x /etc/init.d/AdGuardHome ]; then
+    rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart;
   else
     echo 'AdGuardHome 서비스 관리 명령을 찾을 수 없습니다.' >&2; exit 1;
   fi\"
