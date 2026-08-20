@@ -84,11 +84,17 @@ setup_ssh() {
         pct exec "$adg" -- ssh-keygen -A
         pct exec "$adg" -- rc-update add sshd default 2>/dev/null || true
     fi
-    if ! pct exec "$adg" -- sh -c 'command -v scp >/dev/null 2>&1'; then
-        echo "[INFO] AdGuard Home에 OpenSSH SCP client 설치..."
-        pct exec "$adg" -- apk add --no-cache openssh-client
-    fi
-    pct exec "$adg" -- rc-service sshd start 2>/dev/null || true
+    # 최신 scp는 SFTP를 사용합니다. 외부 sftp-server 패키지에 의존하지 않는
+    # OpenSSH 내장 internal-sftp를 명시해 Alpine에서 전송 프로토콜을 보장합니다.
+    pct exec "$adg" -- sh -c '
+        config=/etc/ssh/sshd_config
+        if grep -q "^[[:space:]]*Subsystem[[:space:]][[:space:]]*sftp[[:space:]]" "$config"; then
+            sed -i "s|^[[:space:]]*Subsystem[[:space:]][[:space:]]*sftp[[:space:]].*|Subsystem sftp internal-sftp|" "$config"
+        else
+            printf "\nSubsystem sftp internal-sftp\n" >> "$config"
+        fi
+    '
+    pct exec "$adg" -- rc-service sshd restart 2>/dev/null || pct exec "$adg" -- rc-service sshd start
     echo "[3/7] NPM Plus SSH client 확인..."
     if ! pct exec "$npm" -- sh -c 'command -v ssh >/dev/null 2>&1 && command -v scp >/dev/null 2>&1'; then
         pct exec "$npm" -- apk add --no-cache openssh-client
@@ -123,8 +129,8 @@ copy_atomic() {
     local npm=$1 source=$2 ip=$3
     pct exec "$npm" -- sh -c "
         set -eu
-        scp -O -i '$SSH_KEY' -o BatchMode=yes -q '$source/fullchain.pem' root@'$ip':'$ADG_CERT_DIR'/fullchain.pem.tmp
-        scp -O -i '$SSH_KEY' -o BatchMode=yes -q '$source/privkey.pem' root@'$ip':'$ADG_CERT_DIR'/privkey.pem.tmp
+        scp -i '$SSH_KEY' -o BatchMode=yes -q '$source/fullchain.pem' root@'$ip':'$ADG_CERT_DIR'/fullchain.pem.tmp
+        scp -i '$SSH_KEY' -o BatchMode=yes -q '$source/privkey.pem' root@'$ip':'$ADG_CERT_DIR'/privkey.pem.tmp
         ssh -i '$SSH_KEY' root@'$ip' \"set -eu;
           mv '$ADG_CERT_DIR/fullchain.pem.tmp' '$ADG_CERT_DIR/fullchain.pem';
           mv '$ADG_CERT_DIR/privkey.pem.tmp' '$ADG_CERT_DIR/privkey.pem';
@@ -200,8 +206,8 @@ KEY='$SSH_KEY'
 LOG=/var/log/npmplus-adguard-deploy.log
 printf '%s | hook=%s | renewed_lineage=%s\\n' \"\$(date '+%F %T')\" \"\$0\" \"\${RENEWED_LINEAGE:-없음}\" >> \"\$LOG\"
 [ \"\${RENEWED_LINEAGE:-}\" = \"\$LINEAGE\" ] || exit 0
-scp -O -i \"\$KEY\" -o BatchMode=yes -q \"\$LINEAGE/fullchain.pem\" root@\"\$IP\":\"\$DEST\"/fullchain.pem.tmp
-scp -O -i \"\$KEY\" -o BatchMode=yes -q \"\$LINEAGE/privkey.pem\" root@\"\$IP\":\"\$DEST\"/privkey.pem.tmp
+scp -i \"\$KEY\" -o BatchMode=yes -q \"\$LINEAGE/fullchain.pem\" root@\"\$IP\":\"\$DEST\"/fullchain.pem.tmp
+scp -i \"\$KEY\" -o BatchMode=yes -q \"\$LINEAGE/privkey.pem\" root@\"\$IP\":\"\$DEST\"/privkey.pem.tmp
 ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
   mv '\$DEST/fullchain.pem.tmp' '\$DEST/fullchain.pem';
   mv '\$DEST/privkey.pem.tmp' '\$DEST/privkey.pem';
@@ -319,14 +325,14 @@ test_hook() {
     section "Deploy Hook 강제 테스트"
     field "Hook" "$HOOK_DIR/$SEL_HOOK"
     field "대상 AdGuard LXC" "$SEL_ADG"
-    if ! pct exec "$SEL_NPM" -- grep -q 'scp -O ' "$HOOK_DIR/$SEL_HOOK"; then
-        echo "[오류] 설치된 Hook이 구버전입니다 (scp -O 미적용)."
+    if pct exec "$SEL_NPM" -- grep -q 'scp -O ' "$HOOK_DIR/$SEL_HOOK"; then
+        echo "[오류] 설치된 Hook이 구버전입니다 (legacy SCP 방식)."
         echo "       메뉴 1) 새 연결 설치 → 동일 조합 덮어쓰기(Y)로 Hook을 갱신하세요."
         return 1
     fi
-    if ! pct exec "$SEL_ADG" -- sh -c 'command -v scp >/dev/null 2>&1'; then
-        echo "[오류] AdGuard Home에 legacy SCP용 scp 명령이 없습니다."
-        echo "       메뉴 1) 새 연결 설치를 다시 실행하면 openssh-client를 자동 설치합니다."
+    if ! pct exec "$SEL_ADG" -- grep -q '^[[:space:]]*Subsystem[[:space:]]*sftp[[:space:]]*internal-sftp' /etc/ssh/sshd_config; then
+        echo "[오류] AdGuard Home의 internal-sftp 설정이 없습니다."
+        echo "       메뉴 1) 새 연결 설치를 다시 실행하면 SSH 설정을 자동 보정합니다."
         return 1
     fi
     source_digest="$(file_digest "$SEL_NPM" "/opt/npmplus/tls/certbot/live/npm-$SEL_CERT/fullchain.pem")"
