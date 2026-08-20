@@ -149,13 +149,17 @@ register_tls_paths() {
     pct exec "$adg" -- sh -c "
         grep -q '^tls:' '$config' &&
         grep -q '^[[:space:]]*certificate_chain:' '$config' &&
-        grep -q '^[[:space:]]*private_key:' '$config'
-    " || die "AdGuardHome.yaml의 tls/certificate_chain/private_key 항목을 찾지 못했습니다. 수동 등록을 선택하세요."
+        grep -q '^[[:space:]]*private_key:' '$config' &&
+        grep -q '^[[:space:]]*certificate_path:' '$config' &&
+        grep -q '^[[:space:]]*private_key_path:' '$config'
+    " || die "AdGuardHome.yaml의 tls/certificate_chain/private_key/certificate_path/private_key_path 항목을 찾지 못했습니다. 수동 등록을 선택하세요."
     pct exec "$adg" -- sh -c '
         config=$1 cert=$2 key=$3
         cp "$config" "$config.before-npm-adguard.bak"
-        sed -i "s|^\([[:space:]]*certificate_chain:[[:space:]]*\).*|\1\"$cert\"|" "$config"
-        sed -i "s|^\([[:space:]]*private_key:[[:space:]]*\).*|\1\"$key\"|" "$config"
+        sed -i "s|^\([[:space:]]*certificate_chain:[[:space:]]*\).*|\1\"\"|" "$config"
+        sed -i "s|^\([[:space:]]*private_key:[[:space:]]*\).*|\1\"\"|" "$config"
+        sed -i "s|^\([[:space:]]*certificate_path:[[:space:]]*\).*|\1\"$cert\"|" "$config"
+        sed -i "s|^\([[:space:]]*private_key_path:[[:space:]]*\).*|\1\"$key\"|" "$config"
     ' sh "$config" "$ADG_CERT_DIR/fullchain.pem" "$ADG_CERT_DIR/privkey.pem"
     reload_adguard "$adg"
     echo "[OK] AdGuard Home TLS 경로를 자동 등록했습니다: $config"
@@ -220,7 +224,7 @@ install() {
     pct exec "$npm" -- sh -c "ssh-keyscan -H '$ip' >> /root/.ssh/known_hosts 2>/dev/null || true"
     echo
     echo "AdGuard Home TLS 인증서 경로 등록"
-    echo "  1) 자동 등록 (AdGuardHome.yaml의 certificate_chain/private_key 수정)"
+    echo "  1) 자동 등록 (certificate_chain/private_key 비움, *_path 경로 등록)"
     echo "  2) 수동 등록"
     read -rp "선택 [1-2]: " tls_mode
     case "$tls_mode" in
@@ -252,7 +256,7 @@ install() {
     echo "AdGuard Home 인증서 경로: $ADG_CERT_DIR/fullchain.pem"
     echo "AdGuard Home 개인키 경로:   $ADG_CERT_DIR/privkey.pem"
     if [[ $tls_mode == 2 ]]; then
-        echo "수동 등록: AdGuard Home 설정의 TLS certificate_chain/private_key에 위 경로를 입력하세요."
+        echo "수동 등록: TLS certificate_chain/private_key는 비우고, certificate_path/private_key_path에 위 경로를 입력하세요."
     fi
 }
 status() { local npm; read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"; show_hooks "$npm" || true; }
