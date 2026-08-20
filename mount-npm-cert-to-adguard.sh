@@ -108,7 +108,14 @@ copy_atomic() {
           mv '$ADG_CERT_DIR/privkey.pem.tmp' '$ADG_CERT_DIR/privkey.pem';
           chmod 644 '$ADG_CERT_DIR/fullchain.pem';
           chmod 600 '$ADG_CERT_DIR/privkey.pem';
-          systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome\"
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome;
+          elif command -v rc-service >/dev/null 2>&1; then
+            rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart ||
+              rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart;
+          else
+            echo 'AdGuardHome 서비스 관리 명령을 찾을 수 없습니다.' >&2; exit 1;
+          fi\"
     "
 }
 write_hook() {
@@ -127,7 +134,14 @@ ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
   mv '\$DEST/privkey.pem.tmp' '\$DEST/privkey.pem';
   chmod 644 '\$DEST/fullchain.pem';
   chmod 600 '\$DEST/privkey.pem';
-  systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome\"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome;
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart ||
+      rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart;
+  else
+    echo 'AdGuardHome 서비스 관리 명령을 찾을 수 없습니다.' >&2; exit 1;
+  fi\"
 "
     b64="$(printf '%s' "$content" | base64 | tr -d '\n')"
     pct exec "$npm" -- sh -c "printf '%s' '$b64' | base64 -d > '$target' && chmod 700 '$target'"
