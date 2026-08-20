@@ -319,6 +319,16 @@ test_hook() {
     section "Deploy Hook 강제 테스트"
     field "Hook" "$HOOK_DIR/$SEL_HOOK"
     field "대상 AdGuard LXC" "$SEL_ADG"
+    if ! pct exec "$SEL_NPM" -- grep -q 'scp -O ' "$HOOK_DIR/$SEL_HOOK"; then
+        echo "[오류] 설치된 Hook이 구버전입니다 (scp -O 미적용)."
+        echo "       메뉴 1) 새 연결 설치 → 동일 조합 덮어쓰기(Y)로 Hook을 갱신하세요."
+        return 1
+    fi
+    if ! pct exec "$SEL_ADG" -- sh -c 'command -v scp >/dev/null 2>&1'; then
+        echo "[오류] AdGuard Home에 legacy SCP용 scp 명령이 없습니다."
+        echo "       메뉴 1) 새 연결 설치를 다시 실행하면 openssh-client를 자동 설치합니다."
+        return 1
+    fi
     source_digest="$(file_digest "$SEL_NPM" "/opt/npmplus/tls/certbot/live/npm-$SEL_CERT/fullchain.pem")"
     before_digest="$(file_digest "$SEL_ADG" "$ADG_CERT_DIR/fullchain.pem")"
     field "NPM 인증서 SHA-256" "$source_digest"
