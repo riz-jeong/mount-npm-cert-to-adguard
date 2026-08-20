@@ -18,8 +18,12 @@ SYNC_DIR=/opt/npmplus/tls/.adguard-sync
 MAP_FILE_REMOTE="$SYNC_DIR/mappings.conf"
 LOG_REMOTE=/var/log/npmplus-adguard-deploy.log
 HOOK_DIR=/opt/npmplus/tls/certbot/renewal-hooks/deploy
-HOOK_NAME=99-adguard-sync.sh
-HOOK_PATH="$HOOK_DIR/$HOOK_NAME"
+# Hook 파일명: 99-adguard-{NPM_LXC}-{ADG_LXC}-{CERT_NUM}.sh
+# 예) 99-adguard-101-102-1.sh
+make_hook_name() {
+    # $1=npm_lxc $2=adg_lxc $3=cert_num
+    printf '99-adguard-%s-%s-%s.sh' "$1" "$2" "$3"
+}
 
 # ------------------------------- 출력 도우미 -------------------------------
 if [[ -t 1 ]] && [[ -z ${NO_COLOR:-} ]]; then
@@ -304,37 +308,42 @@ register_tls_paths() {
 }
 
 # ------------------------------- Deploy Hook 생성 -------------------------------
+# 파일명 형식: 99-adguard-{NPM}-{ADG}-{CERT}.sh
+# 각 훅은 해당 인증서→AdGuard 한 쌍만 담당 (self-contained)
 gen_hook_script() {
-    cat > "$1" <<'HOOKEOF'
+    # $1=outfile $2=src_path $3=adg_ip $4=label $5=cert_base(npm-N)
+    local outfile=$1 src_path=$2 adg_ip=$3 label=$4 cert_base=$5
+    cat > "$outfile" <<HOOKEOF
 #!/bin/sh
-# 99-adguard-sync.sh — Certbot Deploy Hook
-# certbot이 인증서를 성공적으로 발급/갱신한 뒤 이 스크립트를 실행합니다.
-# $RENEWED_LINEAGE 가 설정되면 해당 경로만, 없으면(수동 실행) 전체 매핑을 처리합니다.
+# Deploy Hook: ${label}
+# 파일명 형식: 99-adguard-{NPM_LXC}-{ADG_LXC}-{CERT_NUM}.sh
+# certbot 갱신 시 \$RENEWED_LINEAGE 가 이 인증서(npm-N)와 일치하면 AdGuard로 반영
 set -eu
 
-SYNC_DIR=/opt/npmplus/tls/.adguard-sync
-MAP_FILE="$SYNC_DIR/mappings.conf"
+SRC_PATH='${src_path}'
+CERT_BASE='${cert_base}'
+ADG_IP='${adg_ip}'
+LABEL='${label}'
 SSH_KEY=/root/.ssh/id_ed25519_adguard
 ADG_CERT_DIR=/etc/adguardhome/certs
 LOG=/var/log/npmplus-adguard-deploy.log
 
-mkdir -p "$SYNC_DIR"
-touch "$MAP_FILE"
-touch "$LOG"
+mkdir -p "\$(dirname "\$LOG")"
+touch "\$LOG"
 
-log() { printf '%s | %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+log() { printf '%s | %s\n' "\$(date '+%F %T')" "\$*" >> "\$LOG"; }
 
 do_push() {
-    src=$1; ip=$2
-    scp -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -q \
-        "$src/fullchain.pem" root@"$ip":"$ADG_CERT_DIR"/fullchain.pem.tmp 2>>"$LOG" || return 1
-    scp -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -q \
-        "$src/privkey.pem" root@"$ip":"$ADG_CERT_DIR"/privkey.pem.tmp 2>>"$LOG" || return 1
-    ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new root@"$ip" "set -eu;
-        mv '$ADG_CERT_DIR/fullchain.pem.tmp' '$ADG_CERT_DIR/fullchain.pem';
-        mv '$ADG_CERT_DIR/privkey.pem.tmp' '$ADG_CERT_DIR/privkey.pem';
-        chmod 644 '$ADG_CERT_DIR/fullchain.pem';
-        chmod 600 '$ADG_CERT_DIR/privkey.pem';
+    src=\$1; ip=\$2
+    scp -i "\$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -q \\
+        "\$src/fullchain.pem" root@"\$ip":"\$ADG_CERT_DIR"/fullchain.pem.tmp 2>>"\$LOG" || return 1
+    scp -i "\$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -q \\
+        "\$src/privkey.pem" root@"\$ip":"\$ADG_CERT_DIR"/privkey.pem.tmp 2>>"\$LOG" || return 1
+    ssh -i "\$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new root@"\$ip" "set -eu;
+        mv '\$ADG_CERT_DIR/fullchain.pem.tmp' '\$ADG_CERT_DIR/fullchain.pem';
+        mv '\$ADG_CERT_DIR/privkey.pem.tmp' '\$ADG_CERT_DIR/privkey.pem';
+        chmod 644 '\$ADG_CERT_DIR/fullchain.pem';
+        chmod 600 '\$ADG_CERT_DIR/privkey.pem';
         if command -v systemctl >/dev/null 2>&1; then
             systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome;
         elif [ -x /etc/init.d/adguardhome ]; then
@@ -343,88 +352,100 @@ do_push() {
             rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart;
         else
             echo 'AdGuardHome 서비스 관리 명령을 찾을 수 없습니다.' >&2; exit 1;
-        fi" 2>>"$LOG" || return 1
+        fi" 2>>"\$LOG" || return 1
     return 0
 }
 
-push_one() {
-    src=$1; ip=$2; label=$3
-    if [ ! -f "$src/fullchain.pem" ] || [ ! -f "$src/privkey.pem" ]; then
-        log "[WARN] $label: 소스 인증서 없음 ($src)"
-        return 1
+# 실제 파일 경로 결정 (/data 또는 /opt/npmplus)
+resolve_src() {
+    if [ -n "\${RENEWED_LINEAGE:-}" ] && [ -f "\${RENEWED_LINEAGE}/fullchain.pem" ]; then
+        printf '%s' "\$RENEWED_LINEAGE"
+        return
     fi
-    log "[SYNC] $label -> $ip 반영 시도"
-    if do_push "$src" "$ip"; then
-        log "[OK] $label -> $ip 반영 완료"
-    else
-        log "[FAIL] $label -> $ip 반영 실패"
-        return 1
+    if [ -f "\$SRC_PATH/fullchain.pem" ]; then
+        printf '%s' "\$SRC_PATH"
+        return
     fi
+    # /data 경로 fallback
+    alt="/data/tls/certbot/live/\$CERT_BASE"
+    if [ -f "\$alt/fullchain.pem" ]; then
+        printf '%s' "\$alt"
+        return
+    fi
+    printf '%s' "\$SRC_PATH"
 }
 
-# $RENEWED_LINEAGE 가 있으면 해당 인증서만, 없으면 전체
-# 경로 prefix가 /data 또는 /opt/npmplus 등으로 달라도 basename(npm-N)으로 매칭
-if [ -n "${RENEWED_LINEAGE:-}" ]; then
-    log "[HOOK] certbot deploy: RENEWED_LINEAGE=$RENEWED_LINEAGE"
-    lineage_base=$(basename "${RENEWED_LINEAGE%/}")
-    matched=0
-    while IFS='|' read -r src ctid ip label; do
-        case "$src" in ''|'#'*) continue;; esac
-        src_base=$(basename "${src%/}")
-        # 1) 전체 경로 일치  2) basename(npm-N) 일치
-        src_norm=${src%/}
-        lineage_norm=${RENEWED_LINEAGE%/}
-        if [ "$src_norm" = "$lineage_norm" ] || [ "$src_base" = "$lineage_base" ]; then
-            # 실제 파일이 있는 쪽을 소스로 사용 (RENEWED_LINEAGE 우선)
-            real_src=$src
-            if [ -f "$lineage_norm/fullchain.pem" ]; then
-                real_src=$lineage_norm
-            elif [ -f "$src_norm/fullchain.pem" ]; then
-                real_src=$src_norm
-            fi
-            push_one "$real_src" "$ip" "$label" || true
-            matched=1
-        fi
-    done < "$MAP_FILE"
-    if [ "$matched" -eq 0 ]; then
-        log "[HOOK] RENEWED_LINEAGE($lineage_base)에 해당하는 매핑 없음 (무시)"
+should_run() {
+    # 수동 실행(강제 동기화) → 항상 실행
+    if [ -z "\${RENEWED_LINEAGE:-}" ]; then
+        return 0
     fi
+    # certbot deploy → basename 이 이 훅의 인증서와 같을 때만
+    lineage_base=\$(basename "\${RENEWED_LINEAGE%/}")
+    [ "\$lineage_base" = "\$CERT_BASE" ]
+}
+
+if ! should_run; then
+    exit 0
+fi
+
+real_src=\$(resolve_src)
+if [ ! -f "\$real_src/fullchain.pem" ] || [ ! -f "\$real_src/privkey.pem" ]; then
+    log "[WARN] \$LABEL: 소스 인증서 없음 (\$real_src)"
+    exit 0
+fi
+
+if [ -n "\${RENEWED_LINEAGE:-}" ]; then
+    log "[HOOK] certbot deploy: RENEWED_LINEAGE=\$RENEWED_LINEAGE → \$LABEL"
 else
-    # 수동 실행 (강제 동기화)
-    log "[MANUAL] 전체 매핑 강제 동기화"
-    [ -s "$MAP_FILE" ] || { log "[MANUAL] 매핑 없음"; exit 0; }
-    while IFS='|' read -r src ctid ip label; do
-        case "$src" in ''|'#'*) continue;; esac
-        push_one "$src" "$ip" "$label" || true
-    done < "$MAP_FILE"
+    log "[MANUAL] 강제 동기화 → \$LABEL"
+fi
+
+log "[SYNC] \$LABEL -> \$ADG_IP 반영 시도 (src=\$real_src)"
+if do_push "\$real_src" "\$ADG_IP"; then
+    log "[OK] \$LABEL -> \$ADG_IP 반영 완료"
+else
+    log "[FAIL] \$LABEL -> \$ADG_IP 반영 실패"
+    exit 1
 fi
 HOOKEOF
-    chmod 644 "$1"
+    chmod 644 "$outfile"
 }
 
 deploy_hook() {
-    local npm=$1 tmp
+    # $1=npm $2=adg $3=cert_num $4=src_path $5=adg_ip $6=label
+    local npm=$1 adg=$2 cert_num=$3 src_path=$4 adg_ip=$5 label=$6
+    local hook_name hook_path tmp cert_base
+    hook_name="$(make_hook_name "$npm" "$adg" "$cert_num")"
+    hook_path="$HOOK_DIR/$hook_name"
+    cert_base="npm-$cert_num"
     tmp="$(mktemp -d)"
-    gen_hook_script "$tmp/$HOOK_NAME"
+    gen_hook_script "$tmp/$hook_name" "$src_path" "$adg_ip" "$label" "$cert_base"
     pct exec "$npm" -- mkdir -p "$HOOK_DIR" "$SYNC_DIR"
-    pct push "$npm" "$tmp/$HOOK_NAME" "$HOOK_PATH"
-    pct exec "$npm" -- chmod 755 "$HOOK_PATH"
+    pct push "$npm" "$tmp/$hook_name" "$hook_path"
+    pct exec "$npm" -- chmod 755 "$hook_path"
     pct exec "$npm" -- touch "$MAP_FILE_REMOTE"
     rm -rf "$tmp"
-    ok "Deploy Hook 설치됨: $HOOK_PATH"
+    ok "Deploy Hook 설치됨: $hook_path"
+    # 호출측에서 쓸 수 있도록
+    HOOK_NAME_OUT=$hook_name
+    HOOK_PATH_OUT=$hook_path
 }
 
 add_mapping() {
-    local npm=$1 src=$2 ctid=$3 ip=$4 label=$5
-    local esrc ectid eip elabel
+    # 형식: src|ctid|ip|label|hook_name
+    # 같은 인증서(src)를 여러 AdGuard(ctid)에 연결 가능 — 고유 키: src|ctid|
+    local npm=$1 src=$2 ctid=$3 ip=$4 label=$5 hook_name=$6
+    local esrc ectid eip elabel ehook
     esrc=$(sq_escape "$src")
     ectid=$(sq_escape "$ctid")
     eip=$(sq_escape "$ip")
     elabel=$(sq_escape "$label")
+    ehook=$(sq_escape "$hook_name")
     pct exec "$npm" -- sh -c "
         touch '$MAP_FILE_REMOTE'
-        grep -vF '$esrc|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
-        printf '%s|%s|%s|%s\n' '$esrc' '$ectid' '$eip' '$elabel' >> '$MAP_FILE_REMOTE.new'
+        grep -vF '$esrc|$ectid|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
+        printf '%s|%s|%s|%s|%s\n' '$esrc' '$ectid' '$eip' '$elabel' '$ehook' >> '$MAP_FILE_REMOTE.new'
         mv '$MAP_FILE_REMOTE.new' '$MAP_FILE_REMOTE'
     "
 }
@@ -435,15 +456,20 @@ fetch_mappings() {
     pct exec "$1" -- sh -c "cat '$MAP_FILE_REMOTE' 2>/dev/null || true"
 }
 list_mappings_menu() {
-    local npm=$1 i=0 src ctid ip label
+    local npm=$1 i=0 src ctid ip label hook
     MAP_LINES="$(fetch_mappings "$npm")"
     [[ -n $MAP_LINES ]] || { info "등록된 연동이 없습니다."; return 1; }
-    while IFS='|' read -r src ctid ip label; do
+    while IFS='|' read -r src ctid ip label hook; do
         [[ -n $src ]] || continue
         i=$((i + 1))
+        # 구버전 매핑(hook 필드 없음) 호환
+        if [[ -z ${hook:-} ]]; then
+            hook="(구버전 훅)"
+        fi
         printf '%2d) %s\n' "$i" "$label"
         printf '     원본 경로: %s\n' "$src"
         printf '     대상: AdGuard LXC %s (%s)\n' "$ctid" "$ip"
+        printf '     Hook 파일: %s\n' "$hook"
     done <<< "$MAP_LINES"
     return 0
 }
@@ -469,11 +495,18 @@ install() {
     field "인증서" "npm-$PICK_NUM ($PICK_DOMAIN)"
     field "원본 경로" "$PICK_PATH"
 
-    existing="$(pct exec "$npm" -- sh -c "grep -F '$PICK_PATH|' '$MAP_FILE_REMOTE' 2>/dev/null || true")"
+    # 같은 인증서+같은 AdGuard만 중복으로 취급 (다른 AdGuard로의 연동은 허용)
+    existing="$(pct exec "$npm" -- sh -c "grep -F '$PICK_PATH|$adg|' '$MAP_FILE_REMOTE' 2>/dev/null || true")"
     if [[ -n $existing ]]; then
-        info "이미 이 인증서에 대한 연동이 등록되어 있습니다: $existing"
+        info "이미 이 인증서→AdGuard LXC $adg 연동이 등록되어 있습니다: $existing"
         read -rp "덮어쓸까요? (Y/N): " answer
         [[ $answer =~ ^[Yy]$ ]] || { info "설치를 취소했습니다."; return 0; }
+        # 덮어쓸 때 기존 hook 파일도 정리 (이름 동일하므로 deploy_hook이 교체)
+    fi
+    other="$(pct exec "$npm" -- sh -c "grep -F '$PICK_PATH|' '$MAP_FILE_REMOTE' 2>/dev/null | grep -vF '$PICK_PATH|$adg|' || true")"
+    if [[ -n $other ]]; then
+        info "같은 인증서가 다른 AdGuard에도 연결되어 있습니다 (병행 가능):"
+        printf '%s\n' "$other" | while IFS= read -r line; do info "  $line"; done
     fi
 
     section "설치 진행"
@@ -500,13 +533,13 @@ install() {
     fi
 
     echo "[6/6] Certbot Deploy Hook 설치 (추가 패키지 없음)"
-    deploy_hook "$npm"
     if [[ $PICK_TYPE == certbot ]]; then
         label="npm-$PICK_NUM(Let's Encrypt: $PICK_DOMAIN) -> LXC $adg"
     else
         label="npm-$PICK_NUM(Custom: $PICK_DOMAIN) -> LXC $adg"
     fi
-    add_mapping "$npm" "$PICK_PATH" "$adg" "$ip" "$label"
+    deploy_hook "$npm" "$adg" "$PICK_NUM" "$PICK_PATH" "$ip" "$label"
+    add_mapping "$npm" "$PICK_PATH" "$adg" "$ip" "$label" "${HOOK_NAME_OUT}"
     ok "매핑 등록 및 Deploy Hook 준비 완료."
 
     echo
@@ -518,7 +551,7 @@ install() {
     field "인증서 경로" "$ADG_CERT_DIR/fullchain.pem"
     field "개인키 경로" "$ADG_CERT_DIR/privkey.pem"
     field "매핑 파일" "$MAP_FILE_REMOTE (LXC $npm 내부)"
-    field "Deploy Hook" "$HOOK_PATH (LXC $npm 내부)"
+    field "Deploy Hook" "${HOOK_PATH_OUT} (LXC $npm 내부)"
     if [[ $tls_mode == 2 ]]; then
         echo "수동 등록: TLS certificate_chain/private_key는 비우고, certificate_path/private_key_path에 위 경로를 입력하세요."
     fi
@@ -528,24 +561,19 @@ install() {
     echo "  - WebUI 갱신 버튼: NPMplus가 directory hooks를 실행하면 동작 (유지보수자 확인됨)"
     echo "  - Custom 인증서 변경 시: 메뉴 4) 지금 강제 동기화 사용"
     echo "  - 로그: LXC $npm 의 $LOG_REMOTE"
+    echo "  - Hook 파일명 형식: 99-adguard-{NPM}-{ADG}-{CERT}.sh"
 }
 
 status() {
-    local npm src ctid ip label ndig adig
+    local npm src ctid ip label hook ndig adig
     section "연동 상태 조회"
     read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"
 
-    echo "Deploy Hook 상태:"
-    if pct exec "$npm" -- test -x "$HOOK_PATH" 2>/dev/null; then
-        printf '  %s설치됨%s  %s\n' "$C_GREEN" "$C_RESET" "$HOOK_PATH"
-    else
-        printf '  %s없음%s · 메뉴 1) 새 연동 설치로 다시 설정하세요.\n' "$C_RED" "$C_RESET"
-    fi
-    echo
+    echo "Deploy Hook 파일:"
     list_mappings_menu "$npm" || return 0
     echo
     echo "동기화 상태:"
-    while IFS='|' read -r src ctid ip label; do
+    while IFS='|' read -r src ctid ip label hook; do
         [[ -n $src ]] || continue
         ndig="$(file_digest "$npm" "$src/fullchain.pem")"
         if [[ $ctid =~ ^[0-9]+$ ]] && pct status "$ctid" >/dev/null 2>&1; then
@@ -558,6 +586,13 @@ status() {
         else
             printf '  %s[불일치]%s %s · 메뉴 4) 지금 강제 동기화를 실행하세요.\n' "$C_RED" "$C_RESET" "$label"
         fi
+        if [[ -n ${hook:-} && $hook != "(구버전 훅)" ]]; then
+            if pct exec "$npm" -- test -x "$HOOK_DIR/$hook" 2>/dev/null; then
+                printf '     Hook: %s%s%s\n' "$C_GREEN" "$hook" "$C_RESET"
+            else
+                printf '     Hook: %s%s (없음)%s\n' "$C_RED" "$hook" "$C_RESET"
+            fi
+        fi
     done <<< "$MAP_LINES"
     echo
     echo "최근 로그 (LXC $npm 내부 $LOG_REMOTE):"
@@ -565,7 +600,7 @@ status() {
 }
 
 remove_mapping_flow() {
-    local npm pick count line sel_src sel_ctid sel_ip sel_label answer remaining
+    local npm pick count line sel_src sel_ctid sel_ip sel_label sel_hook answer
     section "연동 제거"
     read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"
     list_mappings_menu "$npm" || return 0
@@ -573,33 +608,28 @@ remove_mapping_flow() {
     read -rp "제거할 번호: " pick
     [[ $pick =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= count )) || die "목록에 없는 번호입니다."
     line="$(printf '%s\n' "$MAP_LINES" | sed -n "${pick}p")"
-    IFS='|' read -r sel_src sel_ctid sel_ip sel_label <<< "$line"
+    IFS='|' read -r sel_src sel_ctid sel_ip sel_label sel_hook <<< "$line"
     echo "삭제 대상: $sel_label"
+    [[ -n ${sel_hook:-} ]] && echo "Hook 파일: $sel_hook"
     read -rp "삭제할까요? (Y/N): " answer
     [[ $answer =~ ^[Yy]$ ]] || { info "취소했습니다."; return 0; }
-    local esrc
+    local esrc ectid
     esrc=$(sq_escape "$sel_src")
+    ectid=$(sq_escape "$sel_ctid")
     pct exec "$npm" -- sh -c "
-        grep -vF '$esrc|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
+        grep -vF '$esrc|$ectid|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
         mv '$MAP_FILE_REMOTE.new' '$MAP_FILE_REMOTE'
     "
-    ok "연동을 제거했습니다. AdGuard의 인증서 파일, SSH Key는 유지됩니다."
-    remaining="$(pct exec "$npm" -- sh -c "
-        cnt=\$(grep -c '|' '$MAP_FILE_REMOTE' 2>/dev/null || true)
-        printf '%s' \"\${cnt:-0}\"
-    ")"
-    remaining=${remaining:-0}
-    if [[ "$remaining" -eq 0 ]]; then
-        read -rp "남은 연동이 없습니다. Deploy Hook 파일도 삭제할까요? (Y/N): " answer
-        if [[ $answer =~ ^[Yy]$ ]]; then
-            pct exec "$npm" -- rm -f "$HOOK_PATH" || true
-            ok "Deploy Hook 파일을 삭제했습니다."
-        fi
+    if [[ -n ${sel_hook:-} && $sel_hook != "(구버전 훅)" ]]; then
+        pct exec "$npm" -- rm -f "$HOOK_DIR/$sel_hook" || true
+        ok "연동 및 Hook 파일($sel_hook)을 제거했습니다. (다른 AdGuard 연동은 유지)"
+    else
+        ok "연동을 제거했습니다. (다른 AdGuard 연동은 유지)"
     fi
 }
 
 force_sync_flow() {
-    local npm pick count line src ctid ip label before after
+    local npm pick count line src ctid ip label hook before after hook_path
     section "지금 강제 동기화"
     read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"
     list_mappings_menu "$npm" || return 0
@@ -607,29 +637,44 @@ force_sync_flow() {
     read -rp "동기화할 번호 (전체는 0): " pick
     if [[ $pick == 0 ]]; then
         section "전체 강제 동기화"
-        if ! pct exec "$npm" -- test -x "$HOOK_PATH" 2>/dev/null; then
-            die "Deploy Hook이 없습니다. 메뉴 1) 새 연동 설치를 먼저 실행하세요."
-        fi
-        pct exec "$npm" -- "$HOOK_PATH"
+        while IFS='|' read -r src ctid ip label hook; do
+            [[ -n $src ]] || continue
+            if [[ -z ${hook:-} || $hook == "(구버전 훅)" ]]; then
+                warn "구버전 매핑 스킵: $label"
+                continue
+            fi
+            hook_path="$HOOK_DIR/$hook"
+            if pct exec "$npm" -- test -x "$hook_path" 2>/dev/null; then
+                info "실행: $hook"
+                pct exec "$npm" -- "$hook_path" || warn "실패: $hook"
+            else
+                warn "Hook 없음: $hook"
+            fi
+        done <<< "$MAP_LINES"
         ok "전체 매핑에 대해 강제 동기화를 실행했습니다. 로그를 확인하세요."
         return 0
     fi
     [[ $pick =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= count )) || die "목록에 없는 번호입니다."
     line="$(printf '%s\n' "$MAP_LINES" | sed -n "${pick}p")"
-    IFS='|' read -r src ctid ip label <<< "$line"
+    IFS='|' read -r src ctid ip label hook <<< "$line"
     section "강제 동기화 실행"
     field "대상" "$label"
+    [[ -n ${hook:-} ]] && field "Hook" "$hook"
+    if [[ -z ${hook:-} || $hook == "(구버전 훅)" ]]; then
+        die "이 매핑에 Hook 파일이 없습니다. 메뉴 1)로 다시 설치하세요."
+    fi
+    hook_path="$HOOK_DIR/$hook"
+    if ! pct exec "$npm" -- test -x "$hook_path" 2>/dev/null; then
+        die "Hook 파일이 없습니다: $hook_path"
+    fi
     if ! pct exec "$ctid" -- rc-service sshd status >/dev/null 2>&1; then
         die "AdGuard Home SSH 서버(sshd)가 실행 중이 아닙니다. 메뉴 1) 새 연동 설치를 다시 실행하세요."
     fi
     before="$(file_digest "$ctid" "$ADG_CERT_DIR/fullchain.pem")"
     field "AdGuard 이전 SHA-256" "$before"
     echo
-    # 단일 매핑만 임시로 처리하기 위해 RENEWED_LINEAGE를 흉내냄
-    pct exec "$npm" -- sh -c "
-        export RENEWED_LINEAGE='$src'
-        '$HOOK_PATH'
-    "
+    # 수동 실행 (RENEWED_LINEAGE 없이) → 해당 훅이 바로 push
+    pct exec "$npm" -- "$hook_path"
     after="$(file_digest "$ctid" "$ADG_CERT_DIR/fullchain.pem")"
     field "AdGuard 이후 SHA-256" "$after"
     src_digest="$(file_digest "$npm" "$src/fullchain.pem")"
