@@ -110,13 +110,55 @@ copy_atomic() {
           chmod 600 '$ADG_CERT_DIR/privkey.pem';
           if command -v systemctl >/dev/null 2>&1; then
             systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome;
-          elif command -v rc-service >/dev/null 2>&1; then
-            rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart ||
-              rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart;
+          elif [ -x /etc/init.d/AdGuardHome ]; then
+            rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart;
+          elif [ -x /etc/init.d/adguardhome ]; then
+            rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart;
           else
             echo 'AdGuardHome 서비스 관리 명령을 찾을 수 없습니다.' >&2; exit 1;
           fi\"
     "
+}
+reload_adguard() {
+    pct exec "$1" -- sh -c '
+        set -eu
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome
+        elif [ -x /etc/init.d/AdGuardHome ]; then
+            rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart
+        elif [ -x /etc/init.d/adguardhome ]; then
+            rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart
+        else
+            echo "AdGuardHome 서비스 관리 명령을 찾을 수 없습니다." >&2
+            exit 1
+        fi
+    '
+}
+find_adguard_config() {
+    pct exec "$1" -- sh -c '
+        for config in +            /opt/AdGuardHome/AdGuardHome.yaml +            /opt/adguardhome/AdGuardHome.yaml +            /etc/adguardhome/AdGuardHome.yaml; do
+            [ -f "$config" ] && { printf "%s\n" "$config"; exit 0; }
+        done
+        exit 1
+    ' 2>/dev/null || true
+}
+register_tls_paths() {
+    local adg=$1 config
+    config="$(find_adguard_config "$adg")"
+    [[ -n $config ]] || die "AdGuardHome.yaml을 자동으로 찾지 못했습니다. 수동 등록을 선택하세요."
+    pct exec "$adg" -- sh -c "
+        grep -q '^tls:' '$config' &&
+        grep -q '^[[:space:]]*certificate_chain:' '$config' &&
+        grep -q '^[[:space:]]*private_key:' '$config'
+    " || die "AdGuardHome.yaml의 tls/certificate_chain/private_key 항목을 찾지 못했습니다. 수동 등록을 선택하세요."
+    pct exec "$adg" -- sh -c '
+        config=$1 cert=$2 key=$3
+        cp "$config" "$config.before-npm-adguard.bak"
+        sed -i "s|^\([[:space:]]*certificate_chain:[[:space:]]*\).*|\1\"$cert\"|" "$config"
+        sed -i "s|^\([[:space:]]*private_key:[[:space:]]*\).*|\1\"$key\"|" "$config"
+    ' sh "$config" "$ADG_CERT_DIR/fullchain.pem" "$ADG_CERT_DIR/privkey.pem"
+    reload_adguard "$adg"
+    echo "[OK] AdGuard Home TLS 경로를 자동 등록했습니다: $config"
 }
 write_hook() {
     local npm=$1 ip=$2 cert=$3 target=$4 content b64
@@ -136,9 +178,10 @@ ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
   chmod 600 '\$DEST/privkey.pem';
   if command -v systemctl >/dev/null 2>&1; then
     systemctl reload AdGuardHome 2>/dev/null || systemctl restart AdGuardHome;
-  elif command -v rc-service >/dev/null 2>&1; then
-    rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart ||
-      rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart;
+  elif [ -x /etc/init.d/AdGuardHome ]; then
+    rc-service AdGuardHome reload 2>/dev/null || rc-service AdGuardHome restart;
+  elif [ -x /etc/init.d/adguardhome ]; then
+    rc-service adguardhome reload 2>/dev/null || rc-service adguardhome restart;
   else
     echo 'AdGuardHome 서비스 관리 명령을 찾을 수 없습니다.' >&2; exit 1;
   fi\"
@@ -148,7 +191,7 @@ ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
 }
 
 install() {
-    local npm adg type cert base source ip answer line hook old_adg old_cert duplicates=""
+    local npm adg type cert base source ip answer tls_mode line hook old_adg old_cert duplicates=""
     read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"
     read -rp "AdGuard Home LXC 번호: " adg; check_ct "$adg"
     echo "인증서 종류: 1) certbot  2) custom"
@@ -175,8 +218,22 @@ install() {
     setup_ssh "$npm" "$adg"
     ip="$(get_ip "$adg")"; echo "AdGuard Home IP: $ip"
     pct exec "$npm" -- sh -c "ssh-keyscan -H '$ip' >> /root/.ssh/known_hosts 2>/dev/null || true"
+    echo
+    echo "AdGuard Home TLS 인증서 경로 등록"
+    echo "  1) 자동 등록 (AdGuardHome.yaml의 certificate_chain/private_key 수정)"
+    echo "  2) 수동 등록"
+    read -rp "선택 [1-2]: " tls_mode
+    case "$tls_mode" in
+        1|2) ;;
+        *) echo "[오류] 1 또는 2를 선택하세요."; return 1 ;;
+    esac
     echo "[5/7] 최초 인증서 Atomic Copy..."
     copy_atomic "$npm" "$source" "$ip"
+    if [[ $tls_mode == 1 ]]; then
+        register_tls_paths "$adg"
+    else
+        echo "[INFO] TLS 경로는 수동 등록으로 선택했습니다."
+    fi
     echo "[6/7] Certbot deploy hook 설치..."
     if [[ $type == 1 ]]; then
         pct exec "$npm" -- mkdir -p "$HOOK_DIR"
@@ -192,6 +249,11 @@ install() {
     echo "[7/7] SSH 연결 테스트..."
     pct exec "$npm" -- sh -c "ssh -i '$SSH_KEY' -o BatchMode=yes root@'$ip' 'echo SSH_OK'"
     echo "[완료] polling, cron, bind mount 없이 자동 연동을 설정했습니다."
+    echo "AdGuard Home 인증서 경로: $ADG_CERT_DIR/fullchain.pem"
+    echo "AdGuard Home 개인키 경로:   $ADG_CERT_DIR/privkey.pem"
+    if [[ $tls_mode == 2 ]]; then
+        echo "수동 등록: AdGuard Home 설정의 TLS certificate_chain/private_key에 위 경로를 입력하세요."
+    fi
 }
 status() { local npm; read -rp "NPM Plus LXC 번호: " npm; check_ct "$npm"; show_hooks "$npm" || true; }
 remove_hook() {
