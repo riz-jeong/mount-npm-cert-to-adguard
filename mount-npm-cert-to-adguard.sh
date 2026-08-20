@@ -29,6 +29,12 @@ info() { printf '%s[INFO]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 die()  { printf '%s[오류]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
+# 원격 sh -c 의 단일따옴표 문자열에 안전하게 삽입하기 위한 이스케이프
+# (예: Let's → Let'\''s 로 변환하여 따옴표 깨짐 방지)
+sq_escape() {
+    printf '%s' "${1//\'/\'\\\'\'}"
+}
+
 check_ct() {
     [[ $1 =~ ^[0-9]+$ ]] || die "LXC 번호는 숫자여야 합니다."
     pct status "$1" >/dev/null 2>&1 || die "LXC $1 를 찾을 수 없습니다."
@@ -401,10 +407,15 @@ deploy_watcher() {
 }
 add_mapping() {
     local npm=$1 src=$2 ctid=$3 ip=$4 label=$5
+    local esrc ectid eip elabel
+    esrc=$(sq_escape "$src")
+    ectid=$(sq_escape "$ctid")
+    eip=$(sq_escape "$ip")
+    elabel=$(sq_escape "$label")
     pct exec "$npm" -- sh -c "
         touch '$MAP_FILE_REMOTE'
-        grep -vF '$src|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
-        printf '%s|%s|%s|%s\n' '$src' '$ctid' '$ip' '$label' >> '$MAP_FILE_REMOTE.new'
+        grep -vF '$esrc|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
+        printf '%s|%s|%s|%s\n' '$esrc' '$ectid' '$eip' '$elabel' >> '$MAP_FILE_REMOTE.new'
         mv '$MAP_FILE_REMOTE.new' '$MAP_FILE_REMOTE'
     "
 }
@@ -555,10 +566,13 @@ remove_mapping_flow() {
     echo "삭제 대상: $sel_label"
     read -rp "삭제할까요? (Y/N): " answer
     [[ $answer =~ ^[Yy]$ ]] || { info "취소했습니다."; return 0; }
+    local esrc elabel
+    esrc=$(sq_escape "$sel_src")
+    elabel=$(sq_escape "$sel_label")
     pct exec "$npm" -- sh -c "
-        grep -vF '$sel_src|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
+        grep -vF '$esrc|' '$MAP_FILE_REMOTE' > '$MAP_FILE_REMOTE.new' 2>/dev/null || true
         mv '$MAP_FILE_REMOTE.new' '$MAP_FILE_REMOTE'
-        rm -f \"$SYNC_DIR/state/\$(printf '%s' '$sel_label' | tr '/ ' '__').digest\"
+        rm -f \"$SYNC_DIR/state/\$(printf '%s' '$elabel' | tr '/ ' '__').digest\"
     "
     ok "연동을 제거했습니다. AdGuard의 인증서 파일, SSH Key는 유지됩니다."
     remaining="$(pct exec "$npm" -- sh -c "grep -c '|' '$MAP_FILE_REMOTE' 2>/dev/null || echo 0")"
