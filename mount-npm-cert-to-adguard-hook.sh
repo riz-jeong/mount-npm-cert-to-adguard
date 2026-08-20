@@ -68,11 +68,59 @@ file_digest() {
 
 # ------------------------------- 인증서 탐색/선택 -------------------------------
 cert_domain() {
-    local ctid=$1 path=$2 out
-    out="$(pct exec "$ctid" -- sh -c "openssl x509 -noout -subject -in '$path' 2>/dev/null | sed -n 's/^subject=.*CN[ ]*=[ ]*//p' | head -n1" 2>/dev/null || true)"
-    if [[ -z $out ]]; then
-        out="$(pct exec "$ctid" -- sh -c "openssl x509 -noout -ext subjectAltName -in '$path' 2>/dev/null | sed -n 's/.*DNS:\([^,]*\).*/\1/p' | head -n1" 2>/dev/null || true)"
+    local ctid=$1 path=$2 out num conf
+    # 1) 인증서 Subject CN
+    out="$(pct exec "$ctid" -- sh -c "
+        openssl x509 -noout -subject -in '$path' 2>/dev/null |
+        sed -n -e 's/.*[Cc][Nn][[:space:]]*=[[:space:]]*//p' |
+        sed 's/,.*//' | head -n1
+    " 2>/dev/null || true)"
+    out="${out//$'\r'/}"
+    out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    # 2) SAN (DNS:) — openssl 버전에 따라 -ext / -text 모두 시도
+    if [[ -z $out || $out == *"="* ]]; then
+        out="$(pct exec "$ctid" -- sh -c "
+            openssl x509 -noout -ext subjectAltName -in '$path' 2>/dev/null ||
+            openssl x509 -noout -text -in '$path' 2>/dev/null
+        " 2>/dev/null | sed -n 's/.*DNS:\([^, ]*\).*/\1/p' | head -n1 || true)"
+        out="${out//$'\r'/}"
+        out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     fi
+
+    # 3) renewal 설정 파일에서 도메인 추출 (webroot_map / domains)
+    if [[ -z $out ]]; then
+        num=$(basename "$(dirname "$path")")
+        num=${num#npm-}
+        conf="/opt/npmplus/tls/certbot/renewal/npm-${num}.conf"
+        # /data 경로도 시도
+        out="$(pct exec "$ctid" -- sh -c "
+            for c in '$conf' /data/tls/certbot/renewal/npm-${num}.conf; do
+                [ -f \"\$c\" ] || continue
+                # [[webroot_map]] 아래 도메인=경로 형태
+                sed -n '/^\[\[webroot_map\]\]/,/^\[/p' \"\$c\" 2>/dev/null |
+                    sed -n 's/^[[:space:]]*\([^[:space:]=]\+\)[[:space:]]*=.*/\1/p' | head -n1
+                # 또는 domains = 라인
+                grep -E '^[[:space:]]*domains[[:space:]]*=' \"\$c\" 2>/dev/null |
+                    sed 's/.*=[[:space:]]*//' | tr ',' '\n' | head -n1
+            done
+        " 2>/dev/null | head -n1 || true)"
+        out="${out//$'\r'/}"
+        out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    fi
+
+    # 4) cert.pem 재시도 (fullchain이 특수 포맷인 경우)
+    if [[ -z $out ]]; then
+        local certpath="${path%/*}/cert.pem"
+        out="$(pct exec "$ctid" -- sh -c "
+            openssl x509 -noout -subject -in '$certpath' 2>/dev/null |
+            sed -n -e 's/.*[Cc][Nn][[:space:]]*=[[:space:]]*//p' |
+            sed 's/,.*//' | head -n1
+        " 2>/dev/null || true)"
+        out="${out//$'\r'/}"
+        out="$(printf '%s' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    fi
+
     [[ -n $out ]] && printf '%s\n' "$out" || printf '%s\n' "(도메인 확인 불가)"
 }
 list_certs() {
