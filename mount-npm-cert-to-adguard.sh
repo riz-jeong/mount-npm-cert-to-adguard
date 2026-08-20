@@ -84,6 +84,10 @@ setup_ssh() {
         pct exec "$adg" -- ssh-keygen -A
         pct exec "$adg" -- rc-update add sshd default 2>/dev/null || true
     fi
+    if ! pct exec "$adg" -- sh -c 'command -v scp >/dev/null 2>&1'; then
+        echo "[INFO] AdGuard Home에 OpenSSH SCP client 설치..."
+        pct exec "$adg" -- apk add --no-cache openssh-client
+    fi
     pct exec "$adg" -- rc-service sshd start 2>/dev/null || true
     echo "[3/7] NPM Plus SSH client 확인..."
     if ! pct exec "$npm" -- sh -c 'command -v ssh >/dev/null 2>&1 && command -v scp >/dev/null 2>&1'; then
@@ -119,8 +123,8 @@ copy_atomic() {
     local npm=$1 source=$2 ip=$3
     pct exec "$npm" -- sh -c "
         set -eu
-        scp -i '$SSH_KEY' -q '$source/fullchain.pem' root@'$ip':'$ADG_CERT_DIR'/fullchain.pem.tmp
-        scp -i '$SSH_KEY' -q '$source/privkey.pem' root@'$ip':'$ADG_CERT_DIR'/privkey.pem.tmp
+        scp -O -i '$SSH_KEY' -o BatchMode=yes -q '$source/fullchain.pem' root@'$ip':'$ADG_CERT_DIR'/fullchain.pem.tmp
+        scp -O -i '$SSH_KEY' -o BatchMode=yes -q '$source/privkey.pem' root@'$ip':'$ADG_CERT_DIR'/privkey.pem.tmp
         ssh -i '$SSH_KEY' root@'$ip' \"set -eu;
           mv '$ADG_CERT_DIR/fullchain.pem.tmp' '$ADG_CERT_DIR/fullchain.pem';
           mv '$ADG_CERT_DIR/privkey.pem.tmp' '$ADG_CERT_DIR/privkey.pem';
@@ -196,8 +200,8 @@ KEY='$SSH_KEY'
 LOG=/var/log/npmplus-adguard-deploy.log
 printf '%s | hook=%s | renewed_lineage=%s\\n' \"\$(date '+%F %T')\" \"\$0\" \"\${RENEWED_LINEAGE:-없음}\" >> \"\$LOG\"
 [ \"\${RENEWED_LINEAGE:-}\" = \"\$LINEAGE\" ] || exit 0
-scp -i \"\$KEY\" -q \"\$LINEAGE/fullchain.pem\" root@\"\$IP\":\"\$DEST\"/fullchain.pem.tmp
-scp -i \"\$KEY\" -q \"\$LINEAGE/privkey.pem\" root@\"\$IP\":\"\$DEST\"/privkey.pem.tmp
+scp -O -i \"\$KEY\" -o BatchMode=yes -q \"\$LINEAGE/fullchain.pem\" root@\"\$IP\":\"\$DEST\"/fullchain.pem.tmp
+scp -O -i \"\$KEY\" -o BatchMode=yes -q \"\$LINEAGE/privkey.pem\" root@\"\$IP\":\"\$DEST\"/privkey.pem.tmp
 ssh -i \"\$KEY\" root@\"\$IP\" \"set -eu;
   mv '\$DEST/fullchain.pem.tmp' '\$DEST/fullchain.pem';
   mv '\$DEST/privkey.pem.tmp' '\$DEST/privkey.pem';
